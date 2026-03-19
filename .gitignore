@@ -1,0 +1,25 @@
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+
+# macOS
+.DS_Store
+
+# R package build artifacts
+*.tar.gz
+*.Rcheck/
+
+# Native build artifacts
+src/*.o
+src/*.so
+src/*.dll
+src/*.dylib
+src/*.a
+src/*.obj
+
+# Local checks and logs
+check/
+
+# IDE noise
+.vscode/*.log

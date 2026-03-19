@@ -1,0 +1,36 @@
+name: R-CMD-check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  R-CMD-check:
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install dependencies
+        run: |
+          Rscript -e 'install.packages(c("Rcpp", "testthat"), repos = "https://cloud.r-project.org")'
+
+      - name: Build source tarball
+        run: R CMD build .
+
+      - name: Check package (as-cran)
+        run: |
+          Rscript -e 'tb <- list.files(pattern = "\\.tar\\.gz$", full.names = TRUE); if (length(tb) != 1) stop("Expected exactly one tarball"); status <- system2("R", c("CMD", "check", "--as-cran", "--no-manual", tb), stdout = "", stderr = ""); if (status != 0) quit(status = status)'
