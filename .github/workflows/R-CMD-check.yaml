@@ -6,9 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   R-CMD-check:
     runs-on: ${{ matrix.config.os }}
@@ -32,9 +29,8 @@ jobs:
           Rscript -e 'install.packages(c("Rcpp", "testthat"), repos = "https://cloud.r-project.org")'
 
       - name: Build source tarball
-        run: |
-          Rscript -e 'status <- system2("R", c("CMD", "build", ".")); if (status != 0) quit(status = status)'
+        run: R CMD build .
 
       - name: Check package (as-cran)
         run: |
-          Rscript -e 'tb <- list.files(full.names = TRUE); tb <- tb[endsWith(tb, ".tar.gz")]; if (length(tb) != 1) stop("Expected exactly one tarball"); status <- system2("R", c("CMD", "check", "--as-cran", "--no-manual", tb)); if (status != 0) quit(status = status)'
+          Rscript -e 'tb <- list.files(pattern = "\\.tar\\.gz$", full.names = TRUE); if (length(tb) != 1) stop("Expected exactly one tarball"); status <- system2("R", c("CMD", "check", "--as-cran", "--no-manual", tb), stdout = "", stderr = ""); if (status != 0) quit(status = status)'

@@ -1,19 +1,18 @@
 Package: ply
 Type: Package
-Title: Bitboard Chess Engine
+Title: Bitboard Chess Engine for R
 Version: 0.1.0
-Authors@R: person("Qusai", "Jouda", email = "jouda.qusai@gmail.com",
+Authors@R: person("Qusai", "Jouda", email = "qjouda@gmu.edu",
     role = c("aut", "cre"))
 Author: Qusai Jouda [aut, cre]
-Maintainer: Qusai Jouda <jouda.qusai@gmail.com>
+Maintainer: Qusai Jouda <qjouda@gmu.edu>
 Description: A fully legal chess move generator and game engine
-    implemented in C++17 via 'Rcpp'. Provides FEN (Forsyth-Edwards Notation)
-    parsing, PGN (Portable Game Notation) replay, position feature enrichment,
-    and a multi-game registry backed by a bitboard representation.
-URL: https://cran.r-project.org/package=ply,
-    https://github.com/plychess/ply-r
-BugReports: https://github.com/plychess/ply-r/issues
+    implemented in C++17 via Rcpp. Provides FEN parsing, PGN replay,
+    position feature enrichment, and a multi-game registry backed by
+    a bitboard representation.
 License: MIT + file LICENSE
+URL: https://github.com/plychess/ply-R
+BugReports: https://github.com/plychess/ply-R/issues
 Imports:
     Rcpp (>= 1.0.0)
 LinkingTo:

@@ -1,26 +1,8 @@
 # Files to exclude from the build tarball
-^\.Rcheck$
-^\.\.?Rcheck$
 ^ply\.Rcheck$
 ^ply_.*\.tar\.gz$
 ^\.Rhistory$
-^\.git$
-^\.gitignore$
 ^LICENSE\.md$
 ^src/.*\.o$
 ^src/.*\.so$
 ^\.github$
-^\.claude$
-^.*\.pgn$
-^analysis$
-^training$
-^pgnmentor$
-^engine_match$
-^gen_training_data$
-^perft_bench$
-^perft_depth[0-9]+$
-^perft_verify$
-^ply-engine$
-^search_bench$
-^search_test$
-^self_play$

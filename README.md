@@ -25,21 +25,11 @@ Current status: early but functional (v0.1.0). The core move generator, game reg
 
 ## Install
 
-From CRAN (recommended):
-
-```r
-install.packages("ply")
-```
-
-CRAN package page:
-
-https://cran.r-project.org/package=ply
-
-Development version from GitHub:
+From GitHub:
 
 ```r
 install.packages("remotes")
-remotes::install_github("plychess/ply-r")
+remotes::install_github("plychess/ply-R")
 ```
 
 ## Build and Test

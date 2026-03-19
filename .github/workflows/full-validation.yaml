@@ -3,9 +3,6 @@ name: full-validation
 on:
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   heavy-validation:
     runs-on: ubuntu-latest
