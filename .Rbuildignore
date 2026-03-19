@@ -1,7 +1,11 @@
 # Files to exclude from the build tarball
+^\.Rcheck$
+^\.\.?Rcheck$
 ^ply\.Rcheck$
 ^ply_.*\.tar\.gz$
 ^\.Rhistory$
+^\.git$
+^\.gitignore$
 ^LICENSE\.md$
 ^src/.*\.o$
 ^src/.*\.so$
