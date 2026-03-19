@@ -2,10 +2,10 @@ Package: ply
 Type: Package
 Title: Bitboard Chess Engine for R
 Version: 0.1.0
-Authors@R: person("Qusai", "Jouda", email = "qjouda@gmu.edu",
+Authors@R: person("Qusai", "Jouda", email = "jouda.qusai@gmail.com",
     role = c("aut", "cre"))
 Author: Qusai Jouda [aut, cre]
-Maintainer: Qusai Jouda <qjouda@gmu.edu>
+Maintainer: Qusai Jouda <jouda.qusai@gmail.com>
 Description: A fully legal chess move generator and game engine
     implemented in C++17 via Rcpp. Provides FEN parsing, PGN replay,
     position feature enrichment, and a multi-game registry backed by
