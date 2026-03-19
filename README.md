@@ -29,7 +29,7 @@ From GitHub:
 
 ```r
 install.packages("remotes")
-remotes::install_github("plychess/ply-R")
+remotes::install_github("plychess/ply-r")
 ```
 
 ## Build and Test

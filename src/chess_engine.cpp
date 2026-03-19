@@ -1,6 +1,5 @@
 // chess_engine.cpp — Bitboard chess engine implementation.
-// The move generator follows the same bitboard model as the original Solidity
-// prototype, but this code is maintained as a native C++ engine for R.
+// The move generator uses a native bitboard model maintained for the R package.
 
 #include "chess_engine.h"
 #include <sstream>
@@ -1093,7 +1092,7 @@ std::string ply_to_uci(uint32_t ply) {
 
 uint64_t position_hash(const GameState& state) {
     // Simple hash combining bitboards, castling, ep, side
-    // Uses FNV-1a rather than the earlier keccak-based prototype hash
+    // Uses FNV-1a for stable position hashing.
     uint64_t h = 14695981039346656037ULL; // FNV offset basis
     for (int i = 0; i < 12; i++) {
         h ^= state.bitboards[i];

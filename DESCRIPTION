@@ -11,8 +11,6 @@ Description: A fully legal chess move generator and game engine
     position feature enrichment, and a multi-game registry backed by
     a bitboard representation.
 License: MIT + file LICENSE
-URL: https://github.com/plychess/ply-R
-BugReports: https://github.com/plychess/ply-R/issues
 Imports:
     Rcpp (>= 1.0.0)
 LinkingTo:

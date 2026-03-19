@@ -16,14 +16,6 @@ implemented in C++17 via Rcpp. The package exposes two layers:
   R helpers and test infrastructure.
 }
 }
-\seealso{
-Useful links:
-\itemize{
-  \item \url{https://github.com/plychess/ply-R}
-  \item Report bugs at \url{https://github.com/plychess/ply-R/issues}
-}
-
-}
 \author{
 \strong{Maintainer}: Qusai Jouda \email{qjouda@gmu.edu}
 

@@ -1,6 +1,5 @@
 // chess_engine.h — Bitboard chess engine core.
-// The implementation was originally derived from a Solidity prototype and now
-// lives as a standalone C++ engine for the R package.
+// This implementation provides the standalone C++ engine used by the R package.
 //
 // Square mapping:
 //   sq = rank * 8 + file
