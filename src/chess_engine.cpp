@@ -285,6 +285,17 @@ uint64_t bishop_attacks(uint8_t sq, uint64_t occ) {
 // Init starting position
 // ============================================================
 
+static void rebuild_mailbox(GameState& state) {
+    std::memset(state.mailbox, NO_PIECE, 64);
+    for (int p = 0; p < 12; p++) {
+        uint64_t bb = state.bitboards[p];
+        while (bb) {
+            uint8_t sq = pop_lsb(bb);
+            state.mailbox[sq] = static_cast<uint8_t>(p);
+        }
+    }
+}
+
 void init_game(GameState& state) {
     std::memset(&state, 0, sizeof(state));
     state.bitboards[WHITE_OFFSET + PIECE_PAWN]   = 0x000000000000FF00ULL;
@@ -304,6 +315,7 @@ void init_game(GameState& state) {
     state.enPassantSquare = NO_EP;
     state.halfMoveClock = 0;
     state.fullMoveNumber = 1;
+    rebuild_mailbox(state);
     state.hash = compute_zobrist(state);
 }
 
@@ -418,20 +430,21 @@ static void move_piece(GameState& state, uint8_t piece_index, uint8_t from, uint
     uint64_t mask_from = 1ULL << from;
     uint64_t mask_to = 1ULL << to;
     state.bitboards[piece_index] = (state.bitboards[piece_index] & ~mask_from) | mask_to;
+    state.mailbox[to] = piece_index;
+    state.mailbox[from] = NO_PIECE;
 }
 
 static void add_piece(GameState& state, uint8_t color, uint8_t piece_type, uint8_t square) {
     uint8_t idx = (color == COLOR_WHITE) ? WHITE_OFFSET + piece_type : BLACK_OFFSET + piece_type;
     state.bitboards[idx] |= (1ULL << square);
+    state.mailbox[square] = idx;
 }
 
-static void remove_piece_at_side(GameState& state, uint8_t square, uint8_t side_offset) {
-    uint64_t bit = 1ULL << square;
-    for (int i = 0; i < 6; i++) {
-        if (state.bitboards[side_offset + i] & bit) {
-            state.bitboards[side_offset + i] &= ~bit;
-            return;
-        }
+static void remove_piece_at_side(GameState& state, uint8_t square, uint8_t /*side_offset*/) {
+    uint8_t pi = state.mailbox[square];
+    if (pi != NO_PIECE) {
+        state.bitboards[pi] &= ~(1ULL << square);
+        state.mailbox[square] = NO_PIECE;
     }
 }
 
@@ -664,33 +677,17 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
     h ^= ZOBRIST_CASTLING[next.castlingRights & 0x0F];
     h ^= ZOBRIST_EP[next.enPassantSquare == NO_EP ? 64 : next.enPassantSquare];
 
-    // Find mover
-    uint64_t from_mask = 1ULL << from;
-    uint8_t piece_type = 0;
-    bool has_piece = false;
-    for (int i = 0; i < 6; i++) {
-        if (next.bitboards[offset + i] & from_mask) {
-            piece_type = static_cast<uint8_t>(i);
-            has_piece = true;
-            break;
-        }
-    }
-    if (!has_piece) return next;
+    // Find mover via mailbox (O(1))
+    uint8_t piece_index = next.mailbox[from];
+    if (piece_index == NO_PIECE) return next;
+    uint8_t piece_type = piece_index - offset;
 
-    // Check dest for capture
+    // Check dest for capture via mailbox (O(1))
     uint64_t to_mask = 1ULL << to;
-    uint64_t opp_occ = side_occupancy(next, color ^ 1);
-    bool dst_has_piece = (opp_occ & to_mask) != 0;
+    uint8_t captured_index = next.mailbox[to];
+    bool dst_has_piece = (captured_index != NO_PIECE);
     bool is_capture = dst_has_piece;
-    uint8_t piece_index = offset + piece_type;
-
-    // Find captured piece type for hash
-    uint8_t captured_type = 255;
-    if (dst_has_piece) {
-        for (int i = 0; i < 6; i++) {
-            if (next.bitboards[opp_offset + i] & to_mask) { captured_type = i; break; }
-        }
-    }
+    uint8_t captured_type = dst_has_piece ? (captured_index - opp_offset) : 255;
 
     if (piece_type == PIECE_PAWN) {
         bool is_ep = is_en_passant_capture(next, color, from, to);
@@ -699,6 +696,7 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
         if (is_ep) {
             uint8_t captured_sq = (color == COLOR_WHITE) ? to - 8 : to + 8;
             next.bitboards[opp_offset + PIECE_PAWN] &= ~(1ULL << captured_sq);
+            next.mailbox[captured_sq] = NO_PIECE;
             h ^= ZOBRIST_PIECE[opp_offset + PIECE_PAWN][captured_sq];
             is_capture = true;
         }
@@ -1998,6 +1996,7 @@ GameState parse_fen(const std::string& fen) {
         state.enPassantSquare = static_cast<uint8_t>(er * 8 + ef);
     }
 
+    rebuild_mailbox(state);
     state.hash = compute_zobrist(state);
     return state;
 }

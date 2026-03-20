@@ -44,9 +44,12 @@ constexpr uint8_t NO_EP = 255;
 // GameState — internal bitboard position representation
 // ============================================================
 
+constexpr uint8_t NO_PIECE = 255;
+
 struct GameState {
     uint64_t bitboards[12];
     uint64_t hash;             // incremental Zobrist hash
+    uint8_t  mailbox[64];      // piece_index (0-11) per square, NO_PIECE if empty
     uint8_t  sideToMove;
     uint8_t  castlingRights;   // bits: 0=WK, 1=WQ, 2=BK, 3=BQ
     uint8_t  enPassantSquare;  // 0-63, 255 = none

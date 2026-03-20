@@ -18,7 +18,7 @@ struct TTEntry {
     uint8_t  depth;
 };
 
-static constexpr size_t TT_SIZE = 1 << 20; // 1M entries = ~24MB (fits in L2)
+static constexpr size_t TT_SIZE = 1 << 22; // 4M entries = ~96MB
 static constexpr size_t TT_MASK = TT_SIZE - 1;
 
 static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
@@ -40,8 +40,9 @@ static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
         total += perft(child, depth - 1, tt);
     }
 
-    // TT store
-    tt[idx] = {h, total, static_cast<uint8_t>(depth)};
+    // TT store (depth-preferred: keep deeper entries)
+    if (tt[idx].depth <= depth)
+        tt[idx] = {h, total, static_cast<uint8_t>(depth)};
     return total;
 }
 

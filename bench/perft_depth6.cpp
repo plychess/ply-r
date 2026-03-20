@@ -15,7 +15,7 @@ using namespace chess;
 using Clock = std::chrono::high_resolution_clock;
 
 struct TTEntry { uint64_t hash; uint64_t nodes; uint8_t depth; };
-static constexpr size_t TT_SIZE = 1 << 20;
+static constexpr size_t TT_SIZE = 1 << 22; // 4M entries
 static constexpr size_t TT_MASK = TT_SIZE - 1;
 
 static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
@@ -33,7 +33,8 @@ static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
         GameState child = apply_ply_to_memory(state, moves[i]);
         total += perft(child, depth - 1, tt);
     }
-    tt[idx] = {h, total, static_cast<uint8_t>(depth)};
+    if (tt[idx].depth <= depth)
+        tt[idx] = {h, total, static_cast<uint8_t>(depth)};
     return total;
 }
 
