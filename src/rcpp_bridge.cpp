@@ -6,6 +6,10 @@
 #include <Rcpp.h>
 #include "chess_engine.h"
 #include "chess_game.h"
+#include <fstream>
+#include <thread>
+#include <algorithm>
+#include <cstring>
 
 using namespace Rcpp;
 
@@ -15,6 +19,7 @@ using namespace Rcpp;
 
 static chess::GameState list_to_state(const List& x) {
     chess::GameState s;
+    std::memset(&s, 0, sizeof(s));
     // bitboards stored as character strings (hex) since R can't hold uint64
     CharacterVector bb = x["bitboards"];
     for (int i = 0; i < 12; i++) {
@@ -25,6 +30,16 @@ static chess::GameState list_to_state(const List& x) {
     s.enPassantSquare = as<int>(x["enPassantSquare"]);
     s.halfMoveClock  = as<int>(x["halfMoveClock"]);
     s.fullMoveNumber = as<int>(x["fullMoveNumber"]);
+    // Rebuild derived fields
+    std::memset(s.mailbox, chess::NO_PIECE, 64);
+    for (int p = 0; p < 12; p++) {
+        uint64_t bb2 = s.bitboards[p];
+        while (bb2) {
+            uint8_t sq = chess::pop_lsb(bb2);
+            s.mailbox[sq] = static_cast<uint8_t>(p);
+        }
+    }
+    s.hash = chess::compute_zobrist(s);
     return s;
 }
 
@@ -737,6 +752,213 @@ DataFrame cpp_replay_games_batch(IntegerVector game_ids, StringVector san_moves,
         Named("uci_move") = ucis,
         Named("ply_num")  = ply_nums,
         Named("ok")       = ok,
+        Named("stringsAsFactors") = false
+    );
+}
+
+// ============================================================
+// Full PGN file replay in C++ (no R string ops)
+// ============================================================
+
+// Simple PGN parser: extract SAN move tokens from a game block
+static std::vector<std::string> extract_san_moves(const char* begin, const char* end) {
+    std::vector<std::string> moves;
+
+    // Skip past tags (lines starting with '[')
+    const char* p = begin;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+        if (p < end && *p == '[') {
+            while (p < end && *p != '\n') p++;
+            if (p < end) p++;
+        } else {
+            break;
+        }
+    }
+
+    // Parse movetext
+    std::string token;
+    int brace_depth = 0;
+    int paren_depth = 0;
+
+    while (p < end) {
+        char c = *p++;
+
+        // Skip comments {...}
+        if (c == '{') { brace_depth++; continue; }
+        if (c == '}') { if (brace_depth > 0) brace_depth--; continue; }
+        if (brace_depth > 0) continue;
+
+        // Skip variations (...)
+        if (c == '(') { paren_depth++; continue; }
+        if (c == ')') { if (paren_depth > 0) paren_depth--; continue; }
+        if (paren_depth > 0) continue;
+
+        // Skip NAGs ($123)
+        if (c == '$') { while (p < end && *p >= '0' && *p <= '9') p++; continue; }
+
+        // Whitespace = token boundary
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            if (!token.empty()) {
+                // Check result BEFORE stripping move numbers
+                bool is_result = (token == "1-0" || token == "0-1" || token == "1/2-1/2" || token == "*");
+                if (is_result) { token.clear(); break; }
+
+                // Strip leading move numbers: "1.e4" -> "e4", "12...Nf6" -> "Nf6"
+                size_t pos = 0;
+                while (pos < token.size() && (token[pos] >= '0' && token[pos] <= '9')) pos++;
+                while (pos < token.size() && token[pos] == '.') pos++;
+                if (pos > 0) token = token.substr(pos);
+
+                if (!token.empty()) {
+                    moves.push_back(token);
+                }
+                token.clear();
+            }
+            continue;
+        }
+
+        token += c;
+    }
+
+    // Handle last token
+    if (!token.empty()) {
+        size_t pos = 0;
+        while (pos < token.size() && (token[pos] >= '0' && token[pos] <= '9')) pos++;
+        while (pos < token.size() && token[pos] == '.') pos++;
+        if (pos > 0) token = token.substr(pos);
+        if (!token.empty()) {
+            bool is_result = (token == "1-0" || token == "0-1" || token == "1/2-1/2" || token == "*");
+            if (!is_result) moves.push_back(token);
+        }
+    }
+
+    return moves;
+}
+
+// [[Rcpp::export]]
+DataFrame cpp_replay_pgn_file(std::string path) {
+    chess::init_attack_tables();
+
+    // Read entire file
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) stop("Cannot open file: " + path);
+    size_t file_size = file.tellg();
+    file.seekg(0);
+    std::string content(file_size, '\0');
+    file.read(&content[0], file_size);
+    file.close();
+
+    // Split into games on "\n[Event " boundaries
+    struct GameBlock { const char* begin; const char* end; };
+    std::vector<GameBlock> blocks;
+    const char* data = content.c_str();
+    const char* data_end = data + content.size();
+    const char* game_start = data;
+
+    // Find first [Event
+    while (game_start < data_end && std::strncmp(game_start, "[Event ", 7) != 0) game_start++;
+
+    const char* scan = game_start + 1;
+    while (scan < data_end) {
+        // Look for \n[Event
+        if (*scan == '\n' && scan + 7 < data_end && std::strncmp(scan + 1, "[Event ", 7) == 0) {
+            blocks.push_back({game_start, scan});
+            game_start = scan + 1;
+            scan = game_start + 1;
+        } else {
+            scan++;
+        }
+    }
+    if (game_start < data_end) blocks.push_back({game_start, data_end});
+
+    // Parse all games and collect flat move arrays
+    std::vector<std::string> all_moves;
+    std::vector<int> game_ids;
+    std::vector<int> game_starts;
+
+    all_moves.reserve(blocks.size() * 80); // ~80 plies average
+
+    for (size_t g = 0; g < blocks.size(); g++) {
+        auto moves = extract_san_moves(blocks[g].begin, blocks[g].end);
+        if (moves.empty()) continue;
+        game_ids.push_back(static_cast<int>(g + 1));
+        game_starts.push_back(static_cast<int>(all_moves.size()));
+        for (auto& m : moves) all_moves.push_back(std::move(m));
+    }
+
+    // Replay all games using the batch engine
+    int n = static_cast<int>(all_moves.size());
+    int n_games = static_cast<int>(game_ids.size());
+
+    // Output buffers
+    std::vector<std::string> out_fens(n);
+    std::vector<std::string> out_ucis(n);
+    std::vector<int>         out_ply_nums(n);
+    std::vector<int>         out_game_ids(n);
+    std::vector<char>        out_ok(n, 0);
+
+    // Multi-threaded replay
+    int hw = std::thread::hardware_concurrency();
+    int n_threads = std::max(1, std::min(hw, n_games));
+
+    auto worker = [&](int tid) {
+        for (int g = tid; g < n_games; g += n_threads) {
+            int start = game_starts[g];
+            int end = (g + 1 < n_games) ? game_starts[g + 1] : n;
+            int gid = game_ids[g];
+
+            chess::GameState state;
+            chess::init_game(state);
+
+            bool game_ok = true;
+            for (int i = start; i < end; i++) {
+                out_game_ids[i] = gid;
+                out_fens[i] = chess::state_to_fen(state);
+                out_ply_nums[i] = (i - start) + 1;
+
+                if (!game_ok) {
+                    out_ucis[i] = "";
+                    out_ok[i] = 0;
+                    continue;
+                }
+
+                uint32_t ply = resolve_san(state, all_moves[i]);
+                if (ply == 0) {
+                    out_ucis[i] = "";
+                    out_ok[i] = 0;
+                    game_ok = false;
+                    continue;
+                }
+                out_ucis[i] = chess::ply_to_uci(ply);
+                out_ok[i] = 1;
+                state = chess::apply_ply_memory(state, ply);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; t++) threads.emplace_back(worker, t);
+    for (auto& t : threads) t.join();
+
+    // Copy to R vectors
+    StringVector r_fens(n), r_ucis(n);
+    IntegerVector r_ply_nums(n), r_game_ids(n);
+    LogicalVector r_ok(n);
+    for (int i = 0; i < n; i++) {
+        r_game_ids[i] = out_game_ids[i];
+        r_fens[i]     = out_fens[i];
+        r_ucis[i]     = out_ok[i] ? String(out_ucis[i]) : NA_STRING;
+        r_ply_nums[i] = out_ply_nums[i];
+        r_ok[i]       = out_ok[i];
+    }
+
+    return DataFrame::create(
+        Named("game_id")  = r_game_ids,
+        Named("fen")      = r_fens,
+        Named("uci_move") = r_ucis,
+        Named("ply_num")  = r_ply_nums,
+        Named("ok")       = r_ok,
         Named("stringsAsFactors") = false
     );
 }

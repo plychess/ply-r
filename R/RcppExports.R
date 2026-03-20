@@ -69,6 +69,10 @@ cpp_replay_games_batch <- function(game_ids, san_moves, game_starts) {
     .Call(`_ply_cpp_replay_games_batch`, game_ids, san_moves, game_starts)
 }
 
+cpp_replay_pgn_file <- function(path) {
+    .Call(`_ply_cpp_replay_pgn_file`, path)
+}
+
 cpp_create_game <- function(creator, settlement_mode, ply_time_limit, initial_time = 0, increment = 0, time_mode = 0L, as_black = FALSE) {
     .Call(`_ply_cpp_create_game`, creator, settlement_mode, ply_time_limit, initial_time, increment, time_mode, as_black)
 }

@@ -204,6 +204,17 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// cpp_replay_pgn_file
+DataFrame cpp_replay_pgn_file(std::string path);
+RcppExport SEXP _ply_cpp_replay_pgn_file(SEXP pathSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type path(pathSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_replay_pgn_file(path));
+    return rcpp_result_gen;
+END_RCPP
+}
 // cpp_create_game
 int cpp_create_game(std::string creator, int settlement_mode, double ply_time_limit, double initial_time, double increment, int time_mode, bool as_black);
 RcppExport SEXP _ply_cpp_create_game(SEXP creatorSEXP, SEXP settlement_modeSEXP, SEXP ply_time_limitSEXP, SEXP initial_timeSEXP, SEXP incrementSEXP, SEXP time_modeSEXP, SEXP as_blackSEXP) {
@@ -398,6 +409,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_ply_cpp_san_to_uci", (DL_FUNC) &_ply_cpp_san_to_uci, 2},
     {"_ply_cpp_replay_game", (DL_FUNC) &_ply_cpp_replay_game, 1},
     {"_ply_cpp_replay_games_batch", (DL_FUNC) &_ply_cpp_replay_games_batch, 3},
+    {"_ply_cpp_replay_pgn_file", (DL_FUNC) &_ply_cpp_replay_pgn_file, 1},
     {"_ply_cpp_create_game", (DL_FUNC) &_ply_cpp_create_game, 7},
     {"_ply_cpp_create_game_from_fen", (DL_FUNC) &_ply_cpp_create_game_from_fen, 8},
     {"_ply_cpp_join_game", (DL_FUNC) &_ply_cpp_join_game, 2},
