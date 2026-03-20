@@ -6,6 +6,8 @@
 #include <Rcpp.h>
 #include "chess_engine.h"
 #include "chess_game.h"
+#include <thread>
+#include <algorithm>
 
 using namespace Rcpp;
 
@@ -682,7 +684,8 @@ DataFrame cpp_replay_game(StringVector san_moves) {
     );
 }
 
-// Replay multiple games in batch. san_moves is a flat vector of all moves.
+// Replay multiple games in batch (multi-threaded).
+// san_moves is a flat vector of all moves.
 // game_ids[g] = ID for game g, game_starts[g] = 1-based index into san_moves
 // where game g begins.
 // [[Rcpp::export]]
@@ -691,52 +694,90 @@ DataFrame cpp_replay_games_batch(IntegerVector game_ids, StringVector san_moves,
     chess::init_attack_tables();
     int n = san_moves.size();
     int n_games = game_starts.size();
-    StringVector fens(n);
-    StringVector ucis(n);
-    IntegerVector ply_nums(n);
-    IntegerVector out_game_ids(n);
-    LogicalVector ok(n);
 
-    for (int g = 0; g < n_games; g++) {
-        int start = game_starts[g] - 1;  // R is 1-indexed
-        int end = (g + 1 < n_games) ? (game_starts[g + 1] - 1) : n;
-        int gid = game_ids[g];
+    // Copy R vectors into std::vector (R objects are not thread-safe)
+    std::vector<int> v_game_ids(game_ids.begin(), game_ids.end());
+    std::vector<int> v_game_starts(game_starts.begin(), game_starts.end());
+    std::vector<std::string> v_san(n);
+    for (int i = 0; i < n; i++) {
+        v_san[i] = as<std::string>(san_moves[i]);
+    }
 
-        chess::GameState state;
-        chess::init_game(state);
+    // Output buffers (plain C++ types, safe for threads)
+    std::vector<std::string> out_fens(n);
+    std::vector<std::string> out_ucis(n);
+    std::vector<int>         out_ply_nums(n);
+    std::vector<int>         out_game_ids(n);
+    std::vector<char>        out_ok(n, 0);  // not std::vector<bool> — bit-packing races
 
-        bool game_ok = true;
-        for (int i = start; i < end; i++) {
-            out_game_ids[i] = gid;
-            fens[i] = chess::state_to_fen(state);
-            ply_nums[i] = (i - start) + 1;
+    // Determine thread count
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    int n_threads = std::max(1, std::min(hw, n_games));
 
-            if (!game_ok) {
-                ucis[i] = NA_STRING;
-                ok[i] = false;
-                continue;
+    auto worker = [&](int tid) {
+        for (int g = tid; g < n_games; g += n_threads) {
+            int start = v_game_starts[g] - 1;  // R is 1-indexed
+            int end = (g + 1 < n_games) ? (v_game_starts[g + 1] - 1) : n;
+            int gid = v_game_ids[g];
+
+            chess::GameState state;
+            chess::init_game(state);
+
+            bool game_ok = true;
+            for (int i = start; i < end; i++) {
+                out_game_ids[i] = gid;
+                out_fens[i] = chess::state_to_fen(state);
+                out_ply_nums[i] = (i - start) + 1;
+
+                if (!game_ok) {
+                    out_ucis[i] = "";
+                    out_ok[i] = false;
+                    continue;
+                }
+
+                uint32_t ply = resolve_san(state, v_san[i]);
+                if (ply == 0) {
+                    out_ucis[i] = "";
+                    out_ok[i] = false;
+                    game_ok = false;
+                    continue;
+                }
+                out_ucis[i] = chess::ply_to_uci(ply);
+                out_ok[i] = true;
+                state = chess::apply_ply_memory(state, ply);
             }
-
-            std::string san = as<std::string>(san_moves[i]);
-            uint32_t ply = resolve_san(state, san);
-            if (ply == 0) {
-                ucis[i] = NA_STRING;
-                ok[i] = false;
-                game_ok = false;
-                continue;
-            }
-            ucis[i] = chess::ply_to_uci(ply);
-            ok[i] = true;
-            state = chess::apply_ply_memory(state, ply);
         }
+    };
+
+    // Launch threads
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; t++) {
+        threads.emplace_back(worker, t);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Copy results back into R vectors
+    StringVector r_fens(n);
+    StringVector r_ucis(n);
+    IntegerVector r_ply_nums(n);
+    IntegerVector r_game_ids(n);
+    LogicalVector r_ok(n);
+    for (int i = 0; i < n; i++) {
+        r_game_ids[i] = out_game_ids[i];
+        r_fens[i]     = out_fens[i];
+        r_ucis[i]     = out_ok[i] ? String(out_ucis[i]) : NA_STRING;
+        r_ply_nums[i] = out_ply_nums[i];
+        r_ok[i]       = out_ok[i];
     }
 
     return DataFrame::create(
-        Named("game_id")  = out_game_ids,
-        Named("fen")      = fens,
-        Named("uci_move") = ucis,
-        Named("ply_num")  = ply_nums,
-        Named("ok")       = ok,
+        Named("game_id")  = r_game_ids,
+        Named("fen")      = r_fens,
+        Named("uci_move") = r_ucis,
+        Named("ply_num")  = r_ply_nums,
+        Named("ok")       = r_ok,
         Named("stringsAsFactors") = false
     );
 }

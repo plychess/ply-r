@@ -32,7 +32,8 @@ ply_pgn_extract_movetext <- function(game_text) {
   txt <- gsub("\\{[^{}]*(?:\\{[^{}]*\\}[^{}]*)*\\}", " ", txt, perl = TRUE)
   txt <- gsub("\\([^)]*\\)",         " ", txt)
   txt <- gsub("\\$\\d+",             " ", txt)
-  txt <- gsub("1-0|0-1|1/2-1/2|\\*"," ", txt)
+  # Truncate at the game result (drop everything after it, including junk footers)
+  txt <- sub("(?s)(1-0|0-1|1/2-1/2|\\*).*$", "", txt, perl = TRUE)
   txt <- gsub("\\d+\\.{1,3}",        " ", txt)
   trimws(gsub("\\s+", " ", txt))
 }
@@ -78,6 +79,40 @@ ply_pgn_load_games <- function(pgn_path) {
     )
   })
   do.call(rbind, rows)
+}
+
+#' Replay all games in a PGN file via the C++ batch engine
+#'
+#' Parses every game in the PGN file, extracts SAN moves, and replays them
+#' through \code{cpp_replay_games_batch}. Returns a data.frame with one row
+#' per ply containing the FEN before the move, the UCI move, and a success flag.
+#'
+#' @param pgn_path Path to a PGN file.
+#' @return A \code{data.frame} with columns \code{game_id}, \code{fen},
+#'   \code{uci_move}, \code{ply_num}, \code{ok}.
+#' @export
+replay_all_games <- function(pgn_path) {
+  lines     <- readLines(pgn_path, warn = FALSE, encoding = "UTF-8")
+  raw       <- paste(lines, collapse = "\n")
+  games_raw <- strsplit(raw, "\n(?=\\[Event )", perl = TRUE)[[1]]
+
+  # Extract movetext for all games at once (vectorised regex)
+  movetexts <- vapply(games_raw, ply_pgn_extract_movetext, character(1),
+                      USE.NAMES = FALSE)
+  move_lists <- strsplit(movetexts, " ")
+  move_lists <- lapply(move_lists, function(m) m[nzchar(m)])
+  lengths    <- lengths(move_lists)
+
+  # Drop empty games
+  keep       <- lengths > 0L
+  move_lists <- move_lists[keep]
+  lengths    <- lengths[keep]
+  ids        <- which(keep)
+
+  all_moves   <- unlist(move_lists, use.names = FALSE)
+  game_starts <- cumsum(c(1L, lengths[-length(lengths)]))
+
+  cpp_replay_games_batch(ids, all_moves, game_starts)
 }
 
 parse_pgn_tags <- ply_pgn_parse_tags
