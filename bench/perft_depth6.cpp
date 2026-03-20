@@ -11,12 +11,13 @@
 #include <vector>
 #include <numeric>
 #include <atomic>
+#include <cstring>
 
 using namespace chess;
 using Clock = std::chrono::high_resolution_clock;
 
-struct TTEntry { uint64_t hash; uint64_t nodes; uint8_t depth; };
-static constexpr size_t TT_SIZE = 1 << 22; // 4M entries
+struct TTEntry { uint64_t key; uint64_t nodes; uint8_t depth; };
+static constexpr size_t TT_SIZE = 1 << 22;
 static constexpr size_t TT_MASK = TT_SIZE - 1;
 
 static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
@@ -25,7 +26,8 @@ static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
 
     uint64_t h = state.hash;
     size_t idx = h & TT_MASK;
-    if (tt[idx].hash == h && tt[idx].depth == depth) return tt[idx].nodes;
+    TTEntry e = tt[idx];
+    if (e.depth == depth && (e.key ^ e.nodes) == h) return e.nodes;
 
     uint32_t moves[256];
     int count = generate_legal_moves_fast(state, moves);
@@ -35,10 +37,12 @@ static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
         __builtin_prefetch(&tt[child.hash & TT_MASK], 0, 1);
         total += perft(child, depth - 1, tt);
     }
-    if (tt[idx].depth <= depth)
-        tt[idx] = {h, total, static_cast<uint8_t>(depth)};
+    if (e.depth <= depth)
+        tt[idx] = {h ^ total, total, static_cast<uint8_t>(depth)};
     return total;
 }
+
+static TTEntry* g_shared_tt = nullptr;
 
 static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
     if (depth <= 2) {
@@ -60,16 +64,17 @@ static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
         }
     }
 
+    if (!g_shared_tt) g_shared_tt = new TTEntry[TT_SIZE]();
+    std::memset(g_shared_tt, 0, TT_SIZE * sizeof(TTEntry));
+
     std::vector<uint64_t> results(work.size(), 0);
     std::atomic<size_t> next_item{0};
     auto worker = [&]() {
-        TTEntry* local_tt = new TTEntry[TT_SIZE]();
         while (true) {
             size_t i = next_item.fetch_add(1, std::memory_order_relaxed);
             if (i >= work.size()) break;
-            results[i] = perft(work[i].state, work[i].remaining_depth, local_tt);
+            results[i] = perft(work[i].state, work[i].remaining_depth, g_shared_tt);
         }
-        delete[] local_tt;
     };
 
     std::vector<std::thread> threads;
