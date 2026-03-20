@@ -46,12 +46,31 @@ constexpr uint8_t NO_EP = 255;
 
 struct GameState {
     uint64_t bitboards[12];
+    uint64_t hash;             // incremental Zobrist hash
     uint8_t  sideToMove;
     uint8_t  castlingRights;   // bits: 0=WK, 1=WQ, 2=BK, 3=BQ
     uint8_t  enPassantSquare;  // 0-63, 255 = none
     uint16_t halfMoveClock;
     uint16_t fullMoveNumber;
 };
+
+// Undo info for make/unmake
+struct UndoInfo {
+    uint64_t hash;
+    uint8_t  castlingRights;
+    uint8_t  enPassantSquare;
+    uint16_t halfMoveClock;
+    uint8_t  capturedPiece;    // piece type (0-5) or 255 if no capture
+    uint8_t  capturedSide;     // offset of captured piece's side
+};
+
+// Zobrist hashing
+void init_zobrist();
+uint64_t compute_zobrist(const GameState& state);
+
+// Make/unmake moves (mutate in place)
+UndoInfo make_move(GameState& state, uint32_t ply);
+void unmake_move(GameState& state, uint32_t ply, const UndoInfo& undo);
 
 // ============================================================
 // Bit manipulation (hardware intrinsics — portable via #ifdef)

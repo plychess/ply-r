@@ -14,26 +14,39 @@
 using namespace chess;
 using Clock = std::chrono::high_resolution_clock;
 
-static uint64_t perft(const GameState& state, int depth) {
+struct TTEntry { uint64_t hash; uint64_t nodes; uint8_t depth; };
+static constexpr size_t TT_SIZE = 1 << 20;
+static constexpr size_t TT_MASK = TT_SIZE - 1;
+
+static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
     if (depth == 0) return 1ULL;
     if (depth == 1) return static_cast<uint64_t>(count_legal_moves(state));
+
+    uint64_t h = state.hash;
+    size_t idx = h & TT_MASK;
+    if (tt[idx].hash == h && tt[idx].depth == depth) return tt[idx].nodes;
+
     uint32_t moves[256];
     int count = generate_legal_moves_fast(state, moves);
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
         GameState child = apply_ply_to_memory(state, moves[i]);
-        total += perft(child, depth - 1);
+        total += perft(child, depth - 1, tt);
     }
+    tt[idx] = {h, total, static_cast<uint8_t>(depth)};
     return total;
 }
 
 static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
-    if (depth <= 2) return perft(state, depth);
+    if (depth <= 2) {
+        TTEntry* tt = new TTEntry[TT_SIZE]();
+        uint64_t r = perft(state, depth, tt);
+        delete[] tt;
+        return r;
+    }
 
-    // Split at depth 2 for better load balancing (~400 work items)
     struct WorkItem { GameState state; int remaining_depth; };
     std::vector<WorkItem> work;
-
     auto root_moves = generate_legal_moves(state);
     for (uint32_t m : root_moves) {
         GameState child1 = apply_ply_to_memory(state, m);
@@ -46,9 +59,11 @@ static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
 
     std::vector<uint64_t> results(work.size(), 0);
     auto worker = [&](int tid) {
+        TTEntry* local_tt = new TTEntry[TT_SIZE]();
         for (size_t i = tid; i < work.size(); i += n_threads) {
-            results[i] = perft(work[i].state, work[i].remaining_depth);
+            results[i] = perft(work[i].state, work[i].remaining_depth, local_tt);
         }
+        delete[] local_tt;
     };
 
     std::vector<std::thread> threads;
