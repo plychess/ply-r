@@ -128,6 +128,7 @@ inline uint64_t side_occupancy(const GameState& s, uint8_t side) {
 
 extern uint64_t KNIGHT_ATTACKS[64];
 extern uint64_t KING_ATTACKS[64];
+extern uint64_t PAWN_ATTACKS[2][64];
 
 void init_attack_tables();
 
@@ -137,9 +138,9 @@ void init_attack_tables();
 
 uint64_t knight_attacks(uint8_t sq);
 uint64_t king_attacks(uint8_t sq);
-uint64_t rook_attacks(uint8_t sq, uint64_t occ, uint64_t own_occ);
-uint64_t bishop_attacks(uint8_t sq, uint64_t occ, uint64_t own_occ);
-uint64_t ray_attacks(uint8_t sq, int8_t df, int8_t dr, uint64_t occ, uint64_t own_occ);
+uint64_t rook_attacks(uint8_t sq, uint64_t occ);
+uint64_t bishop_attacks(uint8_t sq, uint64_t occ);
+uint64_t ray_attacks_slow(uint8_t sq, int8_t df, int8_t dr, uint64_t occ, uint64_t own_occ);
 
 // ============================================================
 // Core engine functions
