@@ -177,6 +177,12 @@ bool validate_position(const GameState& state);
 // Legal move generation (full list)
 std::vector<uint32_t> generate_legal_moves(const GameState& state);
 
+// Fast move generation into caller-provided array (max 256 moves). Returns count.
+int generate_legal_moves_fast(const GameState& state, uint32_t* out);
+
+// Count legal moves without building list (for perft leaf nodes)
+int count_legal_moves(const GameState& state);
+
 // FEN parsing
 GameState parse_fen(const std::string& fen);
 std::string state_to_fen(const GameState& state);
