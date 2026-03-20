@@ -16,11 +16,12 @@ using Clock = std::chrono::high_resolution_clock;
 
 static uint64_t perft(const GameState& state, int depth) {
     if (depth == 0) return 1ULL;
-    if (depth == 1) return generate_legal_moves(state).size();
-    std::vector<uint32_t> moves = generate_legal_moves(state);
+    if (depth == 1) return static_cast<uint64_t>(count_legal_moves(state));
+    uint32_t moves[256];
+    int count = generate_legal_moves_fast(state, moves);
     uint64_t total = 0;
-    for (uint32_t m : moves) {
-        GameState child = apply_ply_to_memory(state, m);
+    for (int i = 0; i < count; i++) {
+        GameState child = apply_ply_to_memory(state, moves[i]);
         total += perft(child, depth - 1);
     }
     return total;

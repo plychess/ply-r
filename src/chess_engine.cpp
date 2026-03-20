@@ -1363,6 +1363,294 @@ std::vector<uint32_t> generate_legal_moves(const GameState& state) {
 }
 
 // ============================================================
+// Fast move generation into caller-provided array
+// ============================================================
+
+static inline int add_pawn_moves_fast(uint32_t* out, int count, uint8_t from, uint8_t to, uint8_t side) {
+    if (is_promotion_square(side, to)) {
+        for (uint8_t p = 1; p <= 4; p++)
+            out[count++] = encode_ply(from, to, p);
+    } else {
+        out[count++] = encode_ply(from, to, 0);
+    }
+    return count;
+}
+
+int generate_legal_moves_fast(const GameState& state, uint32_t* out) {
+    int count = 0;
+
+    uint8_t side = state.sideToMove;
+    uint8_t opp = side ^ 1;
+    uint8_t offset = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (opp == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+
+    uint64_t own_occ = side_occupancy(state, side);
+    uint64_t opp_occ = side_occupancy(state, opp);
+    uint64_t all_occ = own_occ | opp_occ;
+
+    MoveGenInfo info = compute_movegen_info(state);
+    uint8_t king_sq = info.king_sq;
+
+    // King moves
+    {
+        uint64_t king_targets = KING_ATTACKS[king_sq] & ~own_occ & ~info.opp_attacks;
+        king_targets &= ~state.bitboards[opp_off + PIECE_KING];
+        while (king_targets) {
+            uint8_t to = pop_lsb(king_targets);
+            out[count++] = encode_ply(king_sq, to, 0);
+        }
+        if (info.num_checkers == 0) {
+            if (side == COLOR_WHITE) {
+                if ((state.castlingRights & 0x01) && can_castle(state, side, king_sq, 6, all_occ))
+                    out[count++] = encode_ply(king_sq, 6, 0);
+                if ((state.castlingRights & 0x02) && can_castle(state, side, king_sq, 2, all_occ))
+                    out[count++] = encode_ply(king_sq, 2, 0);
+            } else {
+                if ((state.castlingRights & 0x04) && can_castle(state, side, king_sq, 62, all_occ))
+                    out[count++] = encode_ply(king_sq, 62, 0);
+                if ((state.castlingRights & 0x08) && can_castle(state, side, king_sq, 58, all_occ))
+                    out[count++] = encode_ply(king_sq, 58, 0);
+            }
+        }
+    }
+
+    if (info.num_checkers >= 2) return count;
+
+    uint64_t check_mask = info.check_mask;
+    uint64_t ep_bb = (state.enPassantSquare != NO_EP) ? (1ULL << state.enPassantSquare) : 0;
+
+    // Pawns
+    {
+        uint64_t pawns = state.bitboards[offset + PIECE_PAWN];
+        while (pawns) {
+            uint8_t from = pop_lsb(pawns);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            uint64_t push_targets = 0;
+            if (side == COLOR_WHITE) {
+                uint8_t fwd = from + 8;
+                if (fwd < 64 && !(all_occ & (1ULL << fwd))) {
+                    push_targets |= 1ULL << fwd;
+                    if ((from >> 3) == 1 && !(all_occ & (1ULL << (from + 16))))
+                        push_targets |= 1ULL << (from + 16);
+                }
+            } else {
+                if (from >= 8) {
+                    uint8_t fwd = from - 8;
+                    if (!(all_occ & (1ULL << fwd))) {
+                        push_targets |= 1ULL << fwd;
+                        if ((from >> 3) == 6 && !(all_occ & (1ULL << (from - 16))))
+                            push_targets |= 1ULL << (from - 16);
+                    }
+                }
+            }
+            push_targets &= check_mask & pin_mask;
+            while (push_targets) {
+                uint8_t to = pop_lsb(push_targets);
+                count = add_pawn_moves_fast(out, count, from, to, side);
+            }
+
+            uint64_t capture_targets = PAWN_ATTACKS[side][from] & opp_occ & ~state.bitboards[opp_off + PIECE_KING];
+            capture_targets &= check_mask & pin_mask;
+            while (capture_targets) {
+                uint8_t to = pop_lsb(capture_targets);
+                count = add_pawn_moves_fast(out, count, from, to, side);
+            }
+
+            if (ep_bb && (PAWN_ATTACKS[side][from] & ep_bb)) {
+                uint8_t ep_to = state.enPassantSquare;
+                uint32_t ply = encode_ply(from, ep_to, 0);
+                if (is_legal_generated(state, ply))
+                    out[count++] = ply;
+            }
+        }
+    }
+
+    // Knights
+    {
+        uint64_t knights = state.bitboards[offset + PIECE_KNIGHT];
+        while (knights) {
+            uint8_t from = pop_lsb(knights);
+            if (info.pinned & (1ULL << from)) continue;
+            uint64_t targets = KNIGHT_ATTACKS[from] & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask;
+            while (targets) {
+                uint8_t to = pop_lsb(targets);
+                out[count++] = encode_ply(from, to, 0);
+            }
+        }
+    }
+
+    // Bishops
+    {
+        uint64_t bishops = state.bitboards[offset + PIECE_BISHOP];
+        while (bishops) {
+            uint8_t from = pop_lsb(bishops);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+            uint64_t targets = bishop_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) { out[count++] = encode_ply(from, pop_lsb(targets), 0); }
+        }
+    }
+
+    // Rooks
+    {
+        uint64_t rooks = state.bitboards[offset + PIECE_ROOK];
+        while (rooks) {
+            uint8_t from = pop_lsb(rooks);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+            uint64_t targets = rook_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) { out[count++] = encode_ply(from, pop_lsb(targets), 0); }
+        }
+    }
+
+    // Queens
+    {
+        uint64_t queens = state.bitboards[offset + PIECE_QUEEN];
+        while (queens) {
+            uint8_t from = pop_lsb(queens);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+            uint64_t targets = (bishop_attacks(from, all_occ) | rook_attacks(from, all_occ)) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) { out[count++] = encode_ply(from, pop_lsb(targets), 0); }
+        }
+    }
+
+    return count;
+}
+
+// ============================================================
+// Count legal moves without building list (bulk counting)
+// ============================================================
+
+int count_legal_moves(const GameState& state) {
+    int count = 0;
+
+    uint8_t side = state.sideToMove;
+    uint8_t opp = side ^ 1;
+    uint8_t offset = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (opp == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+
+    uint64_t own_occ = side_occupancy(state, side);
+    uint64_t opp_occ = side_occupancy(state, opp);
+    uint64_t all_occ = own_occ | opp_occ;
+
+    MoveGenInfo info = compute_movegen_info(state);
+    uint8_t king_sq = info.king_sq;
+
+    // King moves — popcount the legal king targets
+    {
+        uint64_t king_targets = KING_ATTACKS[king_sq] & ~own_occ & ~info.opp_attacks;
+        king_targets &= ~state.bitboards[opp_off + PIECE_KING];
+        count += popcount(king_targets);
+
+        if (info.num_checkers == 0) {
+            if (side == COLOR_WHITE) {
+                if ((state.castlingRights & 0x01) && can_castle(state, side, king_sq, 6, all_occ)) count++;
+                if ((state.castlingRights & 0x02) && can_castle(state, side, king_sq, 2, all_occ)) count++;
+            } else {
+                if ((state.castlingRights & 0x04) && can_castle(state, side, king_sq, 62, all_occ)) count++;
+                if ((state.castlingRights & 0x08) && can_castle(state, side, king_sq, 58, all_occ)) count++;
+            }
+        }
+    }
+
+    if (info.num_checkers >= 2) return count;
+
+    uint64_t check_mask = info.check_mask;
+    uint64_t ep_bb = (state.enPassantSquare != NO_EP) ? (1ULL << state.enPassantSquare) : 0;
+
+    // Pawns — need special handling for promotions (4 moves per square)
+    {
+        uint64_t pawns = state.bitboards[offset + PIECE_PAWN];
+        uint64_t promo_rank = (side == COLOR_WHITE) ? 0xFF00000000000000ULL : 0x00000000000000FFULL;
+
+        while (pawns) {
+            uint8_t from = pop_lsb(pawns);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            uint64_t push_targets = 0;
+            if (side == COLOR_WHITE) {
+                uint8_t fwd = from + 8;
+                if (fwd < 64 && !(all_occ & (1ULL << fwd))) {
+                    push_targets |= 1ULL << fwd;
+                    if ((from >> 3) == 1 && !(all_occ & (1ULL << (from + 16))))
+                        push_targets |= 1ULL << (from + 16);
+                }
+            } else {
+                if (from >= 8) {
+                    uint8_t fwd = from - 8;
+                    if (!(all_occ & (1ULL << fwd))) {
+                        push_targets |= 1ULL << fwd;
+                        if ((from >> 3) == 6 && !(all_occ & (1ULL << (from - 16))))
+                            push_targets |= 1ULL << (from - 16);
+                    }
+                }
+            }
+            push_targets &= check_mask & pin_mask;
+
+            uint64_t capture_targets = PAWN_ATTACKS[side][from] & opp_occ & ~state.bitboards[opp_off + PIECE_KING];
+            capture_targets &= check_mask & pin_mask;
+
+            uint64_t all_targets = push_targets | capture_targets;
+            uint64_t promo_targets = all_targets & promo_rank;
+            uint64_t non_promo = all_targets & ~promo_rank;
+            count += popcount(non_promo) + popcount(promo_targets) * 4;
+
+            // EP
+            if (ep_bb && (PAWN_ATTACKS[side][from] & ep_bb)) {
+                uint32_t ply = encode_ply(from, state.enPassantSquare, 0);
+                if (is_legal_generated(state, ply)) count++;
+            }
+        }
+    }
+
+    // Knights — pure popcount
+    {
+        uint64_t knights = state.bitboards[offset + PIECE_KNIGHT];
+        while (knights) {
+            uint8_t from = pop_lsb(knights);
+            if (info.pinned & (1ULL << from)) continue;
+            count += popcount(KNIGHT_ATTACKS[from] & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask);
+        }
+    }
+
+    // Bishops — popcount
+    {
+        uint64_t bishops = state.bitboards[offset + PIECE_BISHOP];
+        while (bishops) {
+            uint8_t from = pop_lsb(bishops);
+            uint64_t pin_mask = (info.pinned & (1ULL << from)) ? info.pin_ray[from] : ~0ULL;
+            count += popcount(bishop_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask);
+        }
+    }
+
+    // Rooks — popcount
+    {
+        uint64_t rooks = state.bitboards[offset + PIECE_ROOK];
+        while (rooks) {
+            uint8_t from = pop_lsb(rooks);
+            uint64_t pin_mask = (info.pinned & (1ULL << from)) ? info.pin_ray[from] : ~0ULL;
+            count += popcount(rook_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask);
+        }
+    }
+
+    // Queens — popcount
+    {
+        uint64_t queens = state.bitboards[offset + PIECE_QUEEN];
+        while (queens) {
+            uint8_t from = pop_lsb(queens);
+            uint64_t pin_mask = (info.pinned & (1ULL << from)) ? info.pin_ray[from] : ~0ULL;
+            count += popcount((bishop_attacks(from, all_occ) | rook_attacks(from, all_occ)) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask);
+        }
+    }
+
+    return count;
+}
+
+// ============================================================
 // FEN parsing / output
 // ============================================================
 
