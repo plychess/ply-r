@@ -60,7 +60,44 @@ void init_attack_tables() {
 }
 
 // Auto-initialize on load
-namespace { struct Init { Init() { init_attack_tables(); } } _init; }
+namespace { struct Init { Init() { init_attack_tables(); init_zobrist(); } } _init; }
+
+// ============================================================
+// Zobrist hashing
+// ============================================================
+
+static uint64_t ZOBRIST_PIECE[12][64];
+static uint64_t ZOBRIST_SIDE;
+static uint64_t ZOBRIST_CASTLING[16];
+static uint64_t ZOBRIST_EP[65]; // 0-63 squares + 64 for NO_EP
+
+static uint64_t zobrist_xorshift(uint64_t& s) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s;
+}
+
+void init_zobrist() {
+    uint64_t seed = 0x12345678ABCDEF01ULL;
+    for (int p = 0; p < 12; p++)
+        for (int sq = 0; sq < 64; sq++)
+            ZOBRIST_PIECE[p][sq] = zobrist_xorshift(seed);
+    ZOBRIST_SIDE = zobrist_xorshift(seed);
+    for (int i = 0; i < 16; i++)
+        ZOBRIST_CASTLING[i] = zobrist_xorshift(seed);
+    for (int i = 0; i < 65; i++)
+        ZOBRIST_EP[i] = zobrist_xorshift(seed);
+}
+
+uint64_t compute_zobrist(const GameState& state) {
+    uint64_t h = 0;
+    for (int p = 0; p < 12; p++) {
+        uint64_t bb = state.bitboards[p];
+        while (bb) { h ^= ZOBRIST_PIECE[p][pop_lsb(bb)]; }
+    }
+    if (state.sideToMove == COLOR_BLACK) h ^= ZOBRIST_SIDE;
+    h ^= ZOBRIST_CASTLING[state.castlingRights & 0x0F];
+    h ^= ZOBRIST_EP[state.enPassantSquare == NO_EP ? 64 : state.enPassantSquare];
+    return h;
+}
 
 // ============================================================
 // Attack generation
@@ -267,6 +304,7 @@ void init_game(GameState& state) {
     state.enPassantSquare = NO_EP;
     state.halfMoveClock = 0;
     state.fullMoveNumber = 1;
+    state.hash = compute_zobrist(state);
 }
 
 // ============================================================
@@ -621,6 +659,11 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
     uint8_t offset = (color == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
     uint8_t opp_offset = (color == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
 
+    // Hash: XOR out old castling and EP (will XOR in new values at end)
+    uint64_t h = next.hash;
+    h ^= ZOBRIST_CASTLING[next.castlingRights & 0x0F];
+    h ^= ZOBRIST_EP[next.enPassantSquare == NO_EP ? 64 : next.enPassantSquare];
+
     // Find mover
     uint64_t from_mask = 1ULL << from;
     uint8_t piece_type = 0;
@@ -641,6 +684,14 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
     bool is_capture = dst_has_piece;
     uint8_t piece_index = offset + piece_type;
 
+    // Find captured piece type for hash
+    uint8_t captured_type = 255;
+    if (dst_has_piece) {
+        for (int i = 0; i < 6; i++) {
+            if (next.bitboards[opp_offset + i] & to_mask) { captured_type = i; break; }
+        }
+    }
+
     if (piece_type == PIECE_PAWN) {
         bool is_ep = is_en_passant_capture(next, color, from, to);
         next.enPassantSquare = NO_EP;
@@ -648,6 +699,7 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
         if (is_ep) {
             uint8_t captured_sq = (color == COLOR_WHITE) ? to - 8 : to + 8;
             next.bitboards[opp_offset + PIECE_PAWN] &= ~(1ULL << captured_sq);
+            h ^= ZOBRIST_PIECE[opp_offset + PIECE_PAWN][captured_sq];
             is_capture = true;
         }
 
@@ -658,25 +710,54 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
         if (is_promotion_square(color, to)) {
             uint8_t promoted = promotion_piece_type(promo);
             next.bitboards[offset + PIECE_PAWN] &= ~(1ULL << from);
-            if (dst_has_piece) remove_piece_at_side(next, to, opp_offset);
+            if (dst_has_piece) {
+                remove_piece_at_side(next, to, opp_offset);
+                h ^= ZOBRIST_PIECE[opp_offset + captured_type][to];
+            }
             add_piece(next, color, promoted, to);
+            h ^= ZOBRIST_PIECE[offset + PIECE_PAWN][from];
+            h ^= ZOBRIST_PIECE[offset + promoted][to];
         } else {
-            if (dst_has_piece) remove_piece_at_side(next, to, opp_offset);
+            if (dst_has_piece) {
+                remove_piece_at_side(next, to, opp_offset);
+                h ^= ZOBRIST_PIECE[opp_offset + captured_type][to];
+            }
             move_piece(next, piece_index, from, to);
+            h ^= ZOBRIST_PIECE[piece_index][from];
+            h ^= ZOBRIST_PIECE[piece_index][to];
         }
     } else if (piece_type == PIECE_KING) {
         next.enPassantSquare = NO_EP;
         if (is_castle_move(color, from, to)) {
             apply_castle(next, color, from, to);
+            h ^= ZOBRIST_PIECE[offset + PIECE_KING][from];
+            h ^= ZOBRIST_PIECE[offset + PIECE_KING][to];
+            uint8_t rf, rt;
+            if (color == COLOR_WHITE && to == 6)       { rf = 7; rt = 5; }
+            else if (color == COLOR_WHITE && to == 2)  { rf = 0; rt = 3; }
+            else if (color == COLOR_BLACK && to == 62) { rf = 63; rt = 61; }
+            else                                       { rf = 56; rt = 59; }
+            h ^= ZOBRIST_PIECE[offset + PIECE_ROOK][rf];
+            h ^= ZOBRIST_PIECE[offset + PIECE_ROOK][rt];
         } else {
-            if (dst_has_piece) remove_piece_at_side(next, to, opp_offset);
+            if (dst_has_piece) {
+                remove_piece_at_side(next, to, opp_offset);
+                h ^= ZOBRIST_PIECE[opp_offset + captured_type][to];
+            }
             move_piece(next, piece_index, from, to);
+            h ^= ZOBRIST_PIECE[offset + PIECE_KING][from];
+            h ^= ZOBRIST_PIECE[offset + PIECE_KING][to];
         }
         next.castlingRights = clear_castling_for_king(next.castlingRights, color);
     } else {
         next.enPassantSquare = NO_EP;
-        if (dst_has_piece) remove_piece_at_side(next, to, opp_offset);
+        if (dst_has_piece) {
+            remove_piece_at_side(next, to, opp_offset);
+            h ^= ZOBRIST_PIECE[opp_offset + captured_type][to];
+        }
         move_piece(next, piece_index, from, to);
+        h ^= ZOBRIST_PIECE[piece_index][from];
+        h ^= ZOBRIST_PIECE[piece_index][to];
         if (piece_type == PIECE_ROOK) {
             next.castlingRights = clear_castling_for_rook_move(next.castlingRights, color, from);
         }
@@ -697,6 +778,13 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
     }
 
     next.sideToMove ^= 1;
+
+    // Hash: XOR in new castling, EP, and side change
+    h ^= ZOBRIST_SIDE;
+    h ^= ZOBRIST_CASTLING[next.castlingRights & 0x0F];
+    h ^= ZOBRIST_EP[next.enPassantSquare == NO_EP ? 64 : next.enPassantSquare];
+    next.hash = h;
+
     return next;
 }
 
@@ -1651,6 +1739,203 @@ int count_legal_moves(const GameState& state) {
 }
 
 // ============================================================
+// Make / unmake moves (in-place mutation for perft)
+// ============================================================
+
+static uint8_t find_piece_at(const GameState& state, uint8_t sq, uint8_t side_offset) {
+    uint64_t bit = 1ULL << sq;
+    for (int i = 0; i < 6; i++) {
+        if (state.bitboards[side_offset + i] & bit) return static_cast<uint8_t>(i);
+    }
+    return 255;
+}
+
+UndoInfo make_move(GameState& state, uint32_t ply) {
+    uint8_t from, to, promo;
+    decode_ply(ply, from, to, promo);
+
+    uint8_t color = state.sideToMove;
+    uint8_t offset = (color == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_offset = (color == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
+
+    // Save undo info
+    UndoInfo undo;
+    undo.hash = state.hash;
+    undo.castlingRights = state.castlingRights;
+    undo.enPassantSquare = state.enPassantSquare;
+    undo.halfMoveClock = state.halfMoveClock;
+    undo.capturedPiece = 255;
+    undo.capturedSide = opp_offset;
+
+    uint64_t from_mask = 1ULL << from;
+    uint64_t to_mask = 1ULL << to;
+
+    // Find mover piece type
+    uint8_t piece_type = find_piece_at(state, from, offset);
+
+    // Find captured piece (if any)
+    uint64_t opp_occ = side_occupancy(state, color ^ 1);
+    bool dst_has_piece = (opp_occ & to_mask) != 0;
+    bool is_capture = dst_has_piece;
+
+    if (piece_type == PIECE_PAWN) {
+        bool is_ep = is_en_passant_capture(state, color, from, to);
+        state.enPassantSquare = NO_EP;
+
+        if (is_ep) {
+            uint8_t captured_sq = (color == COLOR_WHITE) ? to - 8 : to + 8;
+            undo.capturedPiece = PIECE_PAWN;
+            state.bitboards[opp_offset + PIECE_PAWN] &= ~(1ULL << captured_sq);
+            // Hash: remove captured pawn
+            state.hash ^= ZOBRIST_PIECE[opp_offset + PIECE_PAWN][captured_sq];
+            is_capture = true;
+        }
+
+        if (is_double_pawn_push(color, from, to)) {
+            state.enPassantSquare = (color == COLOR_WHITE) ? from + 8 : from - 8;
+        }
+
+        if (is_promotion_square(color, to)) {
+            uint8_t promoted = promotion_piece_type(promo);
+            if (dst_has_piece) {
+                undo.capturedPiece = find_piece_at(state, to, opp_offset);
+                state.bitboards[opp_offset + undo.capturedPiece] &= ~to_mask;
+                state.hash ^= ZOBRIST_PIECE[opp_offset + undo.capturedPiece][to];
+            }
+            state.bitboards[offset + PIECE_PAWN] &= ~from_mask;
+            state.bitboards[offset + promoted] |= to_mask;
+            // Hash: remove pawn from 'from', add promoted at 'to'
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_PAWN][from];
+            state.hash ^= ZOBRIST_PIECE[offset + promoted][to];
+        } else {
+            if (dst_has_piece) {
+                undo.capturedPiece = find_piece_at(state, to, opp_offset);
+                state.bitboards[opp_offset + undo.capturedPiece] &= ~to_mask;
+                state.hash ^= ZOBRIST_PIECE[opp_offset + undo.capturedPiece][to];
+            }
+            move_piece(state, offset + piece_type, from, to);
+            state.hash ^= ZOBRIST_PIECE[offset + piece_type][from];
+            state.hash ^= ZOBRIST_PIECE[offset + piece_type][to];
+        }
+    } else if (piece_type == PIECE_KING) {
+        state.enPassantSquare = NO_EP;
+        if (is_castle_move(color, from, to)) {
+            apply_castle(state, color, from, to);
+            // Hash: move king and rook
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_KING][from];
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_KING][to];
+            uint8_t rook_from, rook_to;
+            if (color == COLOR_WHITE && to == 6)       { rook_from = 7; rook_to = 5; }
+            else if (color == COLOR_WHITE && to == 2)  { rook_from = 0; rook_to = 3; }
+            else if (color == COLOR_BLACK && to == 62) { rook_from = 63; rook_to = 61; }
+            else                                       { rook_from = 56; rook_to = 59; }
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_ROOK][rook_from];
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_ROOK][rook_to];
+        } else {
+            if (dst_has_piece) {
+                undo.capturedPiece = find_piece_at(state, to, opp_offset);
+                state.bitboards[opp_offset + undo.capturedPiece] &= ~to_mask;
+                state.hash ^= ZOBRIST_PIECE[opp_offset + undo.capturedPiece][to];
+            }
+            move_piece(state, offset + PIECE_KING, from, to);
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_KING][from];
+            state.hash ^= ZOBRIST_PIECE[offset + PIECE_KING][to];
+        }
+        state.castlingRights = clear_castling_for_king(state.castlingRights, color);
+    } else {
+        state.enPassantSquare = NO_EP;
+        if (dst_has_piece) {
+            undo.capturedPiece = find_piece_at(state, to, opp_offset);
+            state.bitboards[opp_offset + undo.capturedPiece] &= ~to_mask;
+            state.hash ^= ZOBRIST_PIECE[opp_offset + undo.capturedPiece][to];
+        }
+        move_piece(state, offset + piece_type, from, to);
+        state.hash ^= ZOBRIST_PIECE[offset + piece_type][from];
+        state.hash ^= ZOBRIST_PIECE[offset + piece_type][to];
+        if (piece_type == PIECE_ROOK) {
+            state.castlingRights = clear_castling_for_rook_move(state.castlingRights, color, from);
+        }
+    }
+
+    if (dst_has_piece) {
+        state.castlingRights = clear_castling_for_rook_capture(state.castlingRights, to);
+    }
+
+    if (piece_type == PIECE_PAWN || is_capture) {
+        state.halfMoveClock = 0;
+    } else {
+        state.halfMoveClock++;
+    }
+
+    if (state.sideToMove == COLOR_BLACK) state.fullMoveNumber++;
+    state.sideToMove ^= 1;
+
+    // Update hash for side, castling, EP changes
+    state.hash ^= ZOBRIST_SIDE;
+    state.hash ^= ZOBRIST_CASTLING[undo.castlingRights & 0x0F];
+    state.hash ^= ZOBRIST_CASTLING[state.castlingRights & 0x0F];
+    state.hash ^= ZOBRIST_EP[undo.enPassantSquare == NO_EP ? 64 : undo.enPassantSquare];
+    state.hash ^= ZOBRIST_EP[state.enPassantSquare == NO_EP ? 64 : state.enPassantSquare];
+
+    return undo;
+}
+
+void unmake_move(GameState& state, uint32_t ply, const UndoInfo& undo) {
+    uint8_t from, to, promo;
+    decode_ply(ply, from, to, promo);
+
+    // Restore side first
+    state.sideToMove ^= 1;
+    uint8_t color = state.sideToMove;
+    uint8_t offset = (color == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_offset = undo.capturedSide;
+
+    uint64_t from_mask = 1ULL << from;
+    uint64_t to_mask = 1ULL << to;
+
+    uint8_t piece_type = find_piece_at(state, to, offset);
+
+    if (promo != 0) {
+        // Undo promotion: remove promoted piece from 'to', put pawn back on 'from'
+        uint8_t promoted = promotion_piece_type(promo);
+        state.bitboards[offset + promoted] &= ~to_mask;
+        state.bitboards[offset + PIECE_PAWN] |= from_mask;
+    } else if (piece_type == PIECE_KING && is_castle_move(color, from, to)) {
+        // Undo castling: move king back, move rook back
+        move_piece(state, offset + PIECE_KING, to, from);
+        uint8_t rook_from, rook_to;
+        if (color == COLOR_WHITE && to == 6)       { rook_from = 7; rook_to = 5; }
+        else if (color == COLOR_WHITE && to == 2)  { rook_from = 0; rook_to = 3; }
+        else if (color == COLOR_BLACK && to == 62) { rook_from = 63; rook_to = 61; }
+        else                                       { rook_from = 56; rook_to = 59; }
+        move_piece(state, offset + PIECE_ROOK, rook_to, rook_from);
+    } else {
+        // Normal move: move piece back
+        move_piece(state, offset + piece_type, to, from);
+    }
+
+    // Restore captured piece
+    if (undo.capturedPiece != 255) {
+        if (undo.enPassantSquare != NO_EP &&
+            to == undo.enPassantSquare &&
+            find_piece_at(state, from, offset) == PIECE_PAWN) {
+            // EP capture: restore pawn at captured square
+            uint8_t captured_sq = (color == COLOR_WHITE) ? to - 8 : to + 8;
+            state.bitboards[opp_offset + PIECE_PAWN] |= (1ULL << captured_sq);
+        } else {
+            state.bitboards[opp_offset + undo.capturedPiece] |= to_mask;
+        }
+    }
+
+    // Restore state
+    state.hash = undo.hash;
+    state.castlingRights = undo.castlingRights;
+    state.enPassantSquare = undo.enPassantSquare;
+    state.halfMoveClock = undo.halfMoveClock;
+    if (color == COLOR_BLACK) state.fullMoveNumber--;
+}
+
+// ============================================================
 // FEN parsing / output
 // ============================================================
 
@@ -1713,6 +1998,7 @@ GameState parse_fen(const std::string& fen) {
         state.enPassantSquare = static_cast<uint8_t>(er * 8 + ef);
     }
 
+    state.hash = compute_zobrist(state);
     return state;
 }
 

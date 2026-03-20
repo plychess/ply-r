@@ -1,30 +1,60 @@
 // full_summary.cpp — Complete perft summary across all depths and thread counts
-// With bulk counting + deeper thread splitting.
+// With TT + bulk counting + deeper thread splitting.
 #include "../src/chess_engine.h"
 #include <cstdio>
 #include <chrono>
 #include <thread>
 #include <vector>
 #include <numeric>
+#include <cstring>
 
 using namespace chess;
 using Clock = std::chrono::high_resolution_clock;
 
-static uint64_t perft(const GameState& state, int depth) {
+// TT entry: 24 bytes
+struct TTEntry {
+    uint64_t hash;
+    uint64_t nodes;
+    uint8_t  depth;
+};
+
+static constexpr size_t TT_SIZE = 1 << 20; // 1M entries = ~24MB (fits in L2)
+static constexpr size_t TT_MASK = TT_SIZE - 1;
+
+static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
     if (depth == 0) return 1ULL;
     if (depth == 1) return static_cast<uint64_t>(count_legal_moves(state));
+
+    // TT probe (use incremental hash from GameState)
+    uint64_t h = state.hash;
+    size_t idx = h & TT_MASK;
+    if (tt[idx].hash == h && tt[idx].depth == depth) {
+        return tt[idx].nodes;
+    }
+
     uint32_t moves[256];
     int count = generate_legal_moves_fast(state, moves);
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
         GameState child = apply_ply_to_memory(state, moves[i]);
-        total += perft(child, depth - 1);
+        total += perft(child, depth - 1, tt);
     }
+
+    // TT store
+    tt[idx] = {h, total, static_cast<uint8_t>(depth)};
     return total;
 }
 
+// Wrapper that allocates TT once
+static TTEntry g_tt[TT_SIZE]; // global TT for single-threaded
+
+static uint64_t perft_st(const GameState& state, int depth) {
+    std::memset(g_tt, 0, sizeof(g_tt));
+    return perft(state, depth, g_tt);
+}
+
 static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
-    if (depth <= 2) return perft(state, depth);
+    if (depth <= 2) return perft_st(state, depth);
 
     struct WorkItem { GameState state; int remaining_depth; };
     std::vector<WorkItem> work;
@@ -40,9 +70,12 @@ static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
 
     std::vector<uint64_t> results(work.size(), 0);
     auto worker = [&](int tid) {
+        // Each thread gets its own TT
+        TTEntry* local_tt = new TTEntry[TT_SIZE]();
         for (size_t i = tid; i < work.size(); i += n_threads) {
-            results[i] = perft(work[i].state, work[i].remaining_depth);
+            results[i] = perft(work[i].state, work[i].remaining_depth, local_tt);
         }
+        delete[] local_tt;
     };
 
     std::vector<std::thread> threads;
@@ -92,7 +125,7 @@ int main() {
         for (int d = 1; d <= pos.max_depth; d++) {
             if (pos.expected[d-1] == 0) break;
             auto t0 = Clock::now();
-            uint64_t nodes = perft(state, d);
+            uint64_t nodes = perft_st(state, d);
             auto t1 = Clock::now();
             double elapsed = std::chrono::duration<double>(t1 - t0).count();
             double nps = (elapsed > 0.0001) ? nodes / elapsed : 0;
