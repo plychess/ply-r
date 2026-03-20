@@ -1,5 +1,5 @@
 // full_summary.cpp — Complete perft summary across all depths and thread counts
-// With TT + bulk counting + deeper thread splitting.
+// With TT + bulk counting + work-stealing + prefetching.
 #include "../src/chess_engine.h"
 #include <cstdio>
 #include <chrono>
@@ -7,6 +7,7 @@
 #include <vector>
 #include <numeric>
 #include <cstring>
+#include <atomic>
 
 using namespace chess;
 using Clock = std::chrono::high_resolution_clock;
@@ -37,6 +38,8 @@ static uint64_t perft(const GameState& state, int depth, TTEntry* tt) {
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
         GameState child = apply_ply_to_memory(state, moves[i]);
+        // Prefetch the child's TT entry while we recurse
+        __builtin_prefetch(&tt[child.hash & TT_MASK], 0, 1);
         total += perft(child, depth - 1, tt);
     }
 
@@ -70,17 +73,20 @@ static uint64_t perft_mt(const GameState& state, int depth, int n_threads) {
     }
 
     std::vector<uint64_t> results(work.size(), 0);
-    auto worker = [&](int tid) {
-        // Each thread gets its own TT
+    std::atomic<size_t> next_item{0};
+
+    auto worker = [&]() {
         TTEntry* local_tt = new TTEntry[TT_SIZE]();
-        for (size_t i = tid; i < work.size(); i += n_threads) {
+        while (true) {
+            size_t i = next_item.fetch_add(1, std::memory_order_relaxed);
+            if (i >= work.size()) break;
             results[i] = perft(work[i].state, work[i].remaining_depth, local_tt);
         }
         delete[] local_tt;
     };
 
     std::vector<std::thread> threads;
-    for (int t = 0; t < n_threads; t++) threads.emplace_back(worker, t);
+    for (int t = 0; t < n_threads; t++) threads.emplace_back(worker);
     for (auto& t : threads) t.join();
     return std::accumulate(results.begin(), results.end(), 0ULL);
 }
