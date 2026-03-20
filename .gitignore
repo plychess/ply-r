@@ -23,3 +23,5 @@ check/
 
 # IDE noise
 .vscode/*.log
+
+.claude/

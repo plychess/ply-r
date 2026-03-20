@@ -14,8 +14,10 @@ namespace chess {
 
 uint64_t KNIGHT_ATTACKS[64];
 uint64_t KING_ATTACKS[64];
+uint64_t PAWN_ATTACKS[2][64];
 
 static bool tables_initialized = false;
+static void init_magic_tables();
 
 void init_attack_tables() {
     if (tables_initialized) return;
@@ -43,7 +45,18 @@ void init_attack_tables() {
             ((bb << 9) & notA) | ((bb >> 9) & notH) |
             ((bb << 7) & notH) | ((bb >> 7) & notA);
     }
+    // Precompute pawn attack masks.
+    constexpr uint64_t notA = 0xFEFEFEFEFEFEFEFEULL;
+    constexpr uint64_t notH = 0x7F7F7F7F7F7F7F7FULL;
+    for (int sq = 0; sq < 64; sq++) {
+        uint64_t bb = 1ULL << sq;
+        // White pawns attack NW and NE
+        PAWN_ATTACKS[COLOR_WHITE][sq] = ((bb << 7) & notH) | ((bb << 9) & notA);
+        // Black pawns attack SW and SE
+        PAWN_ATTACKS[COLOR_BLACK][sq] = ((bb >> 9) & notH) | ((bb >> 7) & notA);
+    }
     tables_initialized = true;
+    init_magic_tables();
 }
 
 // Auto-initialize on load
@@ -61,8 +74,8 @@ uint64_t king_attacks(uint8_t sq) {
     return KING_ATTACKS[sq];
 }
 
-// Sliding ray attacks
-uint64_t ray_attacks(uint8_t sq, int8_t df, int8_t dr, uint64_t occ, uint64_t own_occ) {
+// Sliding ray attacks (loop-based, used for magic table initialization)
+uint64_t ray_attacks_slow(uint8_t sq, int8_t df, int8_t dr, uint64_t occ, uint64_t own_occ) {
     uint64_t mask = 0;
     int8_t file = sq & 7;
     int8_t rank = sq >> 3;
@@ -79,18 +92,156 @@ uint64_t ray_attacks(uint8_t sq, int8_t df, int8_t dr, uint64_t occ, uint64_t ow
     return mask;
 }
 
-uint64_t rook_attacks(uint8_t sq, uint64_t occ, uint64_t own_occ) {
-    return ray_attacks(sq, 0, 1, occ, own_occ) |   // north
-           ray_attacks(sq, 0, -1, occ, own_occ) |  // south
-           ray_attacks(sq, 1, 0, occ, own_occ) |   // east
-           ray_attacks(sq, -1, 0, occ, own_occ);   // west
+// Helper: compute rook attacks using ray_attacks_slow (no own_occ exclusion)
+static uint64_t rook_attacks_slow(uint8_t sq, uint64_t occ) {
+    return ray_attacks_slow(sq, 0, 1, occ, 0) |
+           ray_attacks_slow(sq, 0, -1, occ, 0) |
+           ray_attacks_slow(sq, 1, 0, occ, 0) |
+           ray_attacks_slow(sq, -1, 0, occ, 0);
 }
 
-uint64_t bishop_attacks(uint8_t sq, uint64_t occ, uint64_t own_occ) {
-    return ray_attacks(sq, 1, 1, occ, own_occ) |    // NE
-           ray_attacks(sq, -1, 1, occ, own_occ) |   // NW
-           ray_attacks(sq, 1, -1, occ, own_occ) |   // SE
-           ray_attacks(sq, -1, -1, occ, own_occ);   // SW
+static uint64_t bishop_attacks_slow(uint8_t sq, uint64_t occ) {
+    return ray_attacks_slow(sq, 1, 1, occ, 0) |
+           ray_attacks_slow(sq, -1, 1, occ, 0) |
+           ray_attacks_slow(sq, 1, -1, occ, 0) |
+           ray_attacks_slow(sq, -1, -1, occ, 0);
+}
+
+// ============================================================
+// Magic Bitboards
+// ============================================================
+
+struct MagicEntry {
+    uint64_t mask;
+    uint64_t magic;
+    int shift;
+    uint64_t* table;
+};
+
+static MagicEntry ROOK_MAGICS[64];
+static MagicEntry BISHOP_MAGICS[64];
+
+// Max table sizes: rook up to 4096 entries per square, bishop up to 512
+static uint64_t ROOK_TABLE[64 * 4096];
+static uint64_t BISHOP_TABLE[64 * 512];
+
+static uint64_t rook_mask(int sq) {
+    uint64_t mask = 0;
+    int r = sq / 8, f = sq % 8;
+    for (int i = r + 1; i < 7; i++) mask |= 1ULL << (i * 8 + f);
+    for (int i = r - 1; i > 0; i--) mask |= 1ULL << (i * 8 + f);
+    for (int i = f + 1; i < 7; i++) mask |= 1ULL << (r * 8 + i);
+    for (int i = f - 1; i > 0; i--) mask |= 1ULL << (r * 8 + i);
+    return mask;
+}
+
+static uint64_t bishop_mask(int sq) {
+    uint64_t mask = 0;
+    int r = sq / 8, f = sq % 8;
+    for (int dr = -1; dr <= 1; dr += 2) {
+        for (int df = -1; df <= 1; df += 2) {
+            int rr = r + dr, ff = f + df;
+            while (rr > 0 && rr < 7 && ff > 0 && ff < 7) {
+                mask |= 1ULL << (rr * 8 + ff);
+                rr += dr; ff += df;
+            }
+        }
+    }
+    return mask;
+}
+
+// Enumerate subsets of mask using Carry-Rippler
+static uint64_t next_subset(uint64_t subset, uint64_t mask) {
+    return (subset - mask) & mask;
+}
+
+// Simple PRNG for magic number search (fixed seed for determinism)
+static uint64_t magic_rand_state = 0x12345678ABCDEF01ULL;
+static uint64_t magic_rand64() {
+    // xorshift64
+    magic_rand_state ^= magic_rand_state << 13;
+    magic_rand_state ^= magic_rand_state >> 7;
+    magic_rand_state ^= magic_rand_state << 17;
+    return magic_rand_state;
+}
+
+static uint64_t sparse_rand64() {
+    return magic_rand64() & magic_rand64() & magic_rand64();
+}
+
+static void init_magic_for_square(int sq, bool is_rook) {
+    uint64_t mask = is_rook ? rook_mask(sq) : bishop_mask(sq);
+    int bits = popcount(mask);
+    int table_size = 1 << bits;
+    int shift = 64 - bits;
+
+    // Enumerate all subsets and compute attacks
+    std::vector<uint64_t> occupancies(table_size);
+    std::vector<uint64_t> attacks(table_size);
+
+    uint64_t subset = 0;
+    for (int i = 0; i < table_size; i++) {
+        occupancies[i] = subset;
+        attacks[i] = is_rook ? rook_attacks_slow(static_cast<uint8_t>(sq), subset)
+                             : bishop_attacks_slow(static_cast<uint8_t>(sq), subset);
+        subset = next_subset(subset, mask);
+    }
+
+    // Get table pointer
+    uint64_t* table = is_rook ? &ROOK_TABLE[sq * 4096] : &BISHOP_TABLE[sq * 512];
+
+    // Find magic number
+    while (true) {
+        uint64_t magic = sparse_rand64();
+
+        // Quick rejection: check if high bits have enough set bits
+        if (popcount((mask * magic) & 0xFF00000000000000ULL) < 6) continue;
+
+        // Clear table
+        std::memset(table, 0xFF, sizeof(uint64_t) * table_size);
+
+        bool collision = false;
+        for (int i = 0; i < table_size; i++) {
+            uint64_t idx = (occupancies[i] * magic) >> shift;
+            if (table[idx] == 0xFFFFFFFFFFFFFFFFULL) {
+                table[idx] = attacks[i];
+            } else if (table[idx] != attacks[i]) {
+                collision = true;
+                break;
+            }
+        }
+
+        if (!collision) {
+            MagicEntry& entry = is_rook ? ROOK_MAGICS[sq] : BISHOP_MAGICS[sq];
+            entry.mask = mask;
+            entry.magic = magic;
+            entry.shift = shift;
+            entry.table = table;
+            return;
+        }
+    }
+}
+
+static bool magic_tables_initialized = false;
+
+static void init_magic_tables() {
+    if (magic_tables_initialized) return;
+    magic_rand_state = 0x12345678ABCDEF01ULL; // reset seed for determinism
+    for (int sq = 0; sq < 64; sq++) {
+        init_magic_for_square(sq, true);   // rook
+        init_magic_for_square(sq, false);  // bishop
+    }
+    magic_tables_initialized = true;
+}
+
+uint64_t rook_attacks(uint8_t sq, uint64_t occ) {
+    const MagicEntry& e = ROOK_MAGICS[sq];
+    return e.table[((occ & e.mask) * e.magic) >> e.shift];
+}
+
+uint64_t bishop_attacks(uint8_t sq, uint64_t occ) {
+    const MagicEntry& e = BISHOP_MAGICS[sq];
+    return e.table[((occ & e.mask) * e.magic) >> e.shift];
 }
 
 // ============================================================
@@ -134,18 +285,10 @@ uint8_t find_king_square(const GameState& state, uint8_t color) {
 bool is_square_attacked_with_occ(const GameState& state, uint8_t square, uint8_t attacker_color, uint64_t occ) {
     uint8_t off = (attacker_color == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
 
-    // Pawn attacks (reverse lookup)
-    if (attacker_color == COLOR_WHITE) {
-        uint64_t pawn_atk = 0;
-        if (square >= 9 && (square & 7) >= 1) pawn_atk |= 1ULL << (square - 9);
-        if (square >= 7 && (square & 7) <= 6) pawn_atk |= 1ULL << (square - 7);
-        if (pawn_atk & state.bitboards[off + PIECE_PAWN]) return true;
-    } else {
-        uint64_t pawn_atk = 0;
-        if (square <= 54 && (square & 7) >= 1) pawn_atk |= 1ULL << (square + 7);
-        if (square <= 56 && (square & 7) <= 6) pawn_atk |= 1ULL << (square + 9);
-        if (pawn_atk & state.bitboards[off + PIECE_PAWN]) return true;
-    }
+    // Pawn attacks (reverse lookup using precomputed table)
+    // If white attacks square, a white pawn must be on a square that attacks it.
+    // That's the same as: from the square, black's pawn attacks hit a white pawn.
+    if (PAWN_ATTACKS[attacker_color ^ 1][square] & state.bitboards[off + PIECE_PAWN]) return true;
 
     // Knight
     if (knight_attacks(square) & state.bitboards[off + PIECE_KNIGHT]) return true;
@@ -155,11 +298,11 @@ bool is_square_attacked_with_occ(const GameState& state, uint8_t square, uint8_t
 
     // Diagonal sliders (bishop + queen)
     uint64_t diag = state.bitboards[off + PIECE_BISHOP] | state.bitboards[off + PIECE_QUEEN];
-    if (diag && (bishop_attacks(square, occ, 0) & diag)) return true;
+    if (diag && (bishop_attacks(square, occ) & diag)) return true;
 
     // Orthogonal sliders (rook + queen)
     uint64_t ortho = state.bitboards[off + PIECE_ROOK] | state.bitboards[off + PIECE_QUEEN];
-    if (ortho && (rook_attacks(square, occ, 0) & ortho)) return true;
+    if (ortho && (rook_attacks(square, occ) & ortho)) return true;
 
     return false;
 }
@@ -561,6 +704,20 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
 // Legal ply validation
 // ============================================================
 
+// Skip pseudo-legal check for moves we already know are pseudo-legal
+// (move generation already ensures piece exists, target is valid, etc.)
+// But we still need to validate castling and check that king isn't left in check.
+static bool is_legal_generated(const GameState& state, uint32_t ply, bool is_castle = false) {
+    if (is_castle) {
+        uint8_t from, to, promo;
+        decode_ply(ply, from, to, promo);
+        uint64_t occ = side_occupancy(state, state.sideToMove) | side_occupancy(state, state.sideToMove ^ 1);
+        if (!can_castle(state, state.sideToMove, from, to, occ)) return false;
+    }
+    GameState next = apply_ply_to_memory(state, ply);
+    return !in_check(next, state.sideToMove);
+}
+
 bool is_legal_ply(const GameState& state, uint32_t ply) {
     if (!is_pseudo_legal_ply(state, ply)) return false;
     uint8_t mover = state.sideToMove;
@@ -631,13 +788,13 @@ LegalPlyResult has_any_legal_ply_with_check(const GameState& state) {
                     targets = knight_attacks(from) & ~own_occ;
                     break;
                 case PIECE_BISHOP:
-                    targets = bishop_attacks(from, occ, own_occ);
+                    targets = bishop_attacks(from, occ) & ~own_occ;
                     break;
                 case PIECE_ROOK:
-                    targets = rook_attacks(from, occ, own_occ);
+                    targets = rook_attacks(from, occ) & ~own_occ;
                     break;
                 case PIECE_QUEEN:
-                    targets = bishop_attacks(from, occ, own_occ) | rook_attacks(from, occ, own_occ);
+                    targets = (bishop_attacks(from, occ) | rook_attacks(from, occ)) & ~own_occ;
                     break;
                 case PIECE_KING: {
                     targets = king_attacks(from) & ~own_occ;
@@ -831,96 +988,377 @@ bool validate_position(const GameState& state) {
 }
 
 // ============================================================
-// Full legal move generation
+// Pin-aware move generation helpers
 // ============================================================
+
+// Bitboard of squares strictly between two aligned squares
+static uint64_t between_bb(uint8_t sq1, uint8_t sq2) {
+    int r1 = sq1 / 8, f1 = sq1 % 8;
+    int r2 = sq2 / 8, f2 = sq2 % 8;
+    int dr = 0, df = 0;
+
+    if (r1 == r2) {
+        df = (f2 > f1) ? 1 : -1;
+    } else if (f1 == f2) {
+        dr = (r2 > r1) ? 1 : -1;
+    } else if (abs(r2 - r1) == abs(f2 - f1)) {
+        dr = (r2 > r1) ? 1 : -1;
+        df = (f2 > f1) ? 1 : -1;
+    } else {
+        return 0; // not aligned
+    }
+
+    uint64_t bb = 0;
+    int r = r1 + dr, f = f1 + df;
+    while (r != r2 || f != f2) {
+        bb |= 1ULL << (r * 8 + f);
+        r += dr; f += df;
+    }
+    return bb;
+}
+
+struct MoveGenInfo {
+    uint64_t checkers;     // enemy pieces giving check
+    uint64_t pinned;       // our pieces pinned to our king
+    uint64_t check_mask;   // valid destination mask for non-king moves
+    uint64_t pin_ray[64];  // for each pinned square, the ray it must stay on
+    uint64_t opp_attacks;  // all squares attacked by opponent (king removed from occ)
+    uint8_t king_sq;
+    int num_checkers;
+};
+
+static MoveGenInfo compute_movegen_info(const GameState& state) {
+    MoveGenInfo info;
+    std::memset(&info, 0, sizeof(info));
+
+    uint8_t side = state.sideToMove;
+    uint8_t opp = side ^ 1;
+    uint8_t offset = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (opp == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+
+    info.king_sq = find_king_square(state, side);
+    uint64_t king_bb = 1ULL << info.king_sq;
+
+    uint64_t own_occ = side_occupancy(state, side);
+    uint64_t opp_occ = side_occupancy(state, opp);
+    uint64_t all_occ = own_occ | opp_occ;
+
+    // --- Compute checkers ---
+    info.checkers = 0;
+
+    // Pawn checkers
+    info.checkers |= PAWN_ATTACKS[side][info.king_sq] & state.bitboards[opp_off + PIECE_PAWN];
+
+    // Knight checkers
+    info.checkers |= KNIGHT_ATTACKS[info.king_sq] & state.bitboards[opp_off + PIECE_KNIGHT];
+
+    // Bishop/Queen checkers (diagonal)
+    uint64_t diag_sliders = state.bitboards[opp_off + PIECE_BISHOP] | state.bitboards[opp_off + PIECE_QUEEN];
+    info.checkers |= bishop_attacks(info.king_sq, all_occ) & diag_sliders;
+
+    // Rook/Queen checkers (orthogonal)
+    uint64_t ortho_sliders = state.bitboards[opp_off + PIECE_ROOK] | state.bitboards[opp_off + PIECE_QUEEN];
+    info.checkers |= rook_attacks(info.king_sq, all_occ) & ortho_sliders;
+
+    info.num_checkers = popcount(info.checkers);
+
+    // --- Compute check_mask ---
+    if (info.num_checkers == 0) {
+        info.check_mask = ~0ULL;
+    } else if (info.num_checkers == 1) {
+        uint8_t checker_sq = lsb_index(info.checkers);
+        uint64_t checker_bb = 1ULL << checker_sq;
+        // If the checker is a slider, include blocking squares
+        if (checker_bb & (diag_sliders | ortho_sliders)) {
+            info.check_mask = checker_bb | between_bb(info.king_sq, checker_sq);
+        } else {
+            // Knight or pawn: can only capture the checker
+            info.check_mask = checker_bb;
+        }
+    } else {
+        // Double check: only king moves
+        info.check_mask = 0;
+    }
+
+    // --- Compute pins ---
+    // For each direction from king, look for pinned pieces
+    static const int8_t dirs[8][2] = {
+        {0,1},{0,-1},{1,0},{-1,0},{1,1},{1,-1},{-1,1},{-1,-1}
+    };
+
+    for (int d = 0; d < 8; d++) {
+        int8_t df = dirs[d][0], dr = dirs[d][1];
+        // Determine which enemy sliders attack along this direction
+        uint64_t attackers;
+        if (d < 4) {
+            // Orthogonal
+            attackers = ortho_sliders;
+        } else {
+            // Diagonal
+            attackers = diag_sliders;
+        }
+        if (!attackers) continue;
+
+        int8_t r = info.king_sq / 8, f = info.king_sq % 8;
+        uint8_t candidate = 255;
+        bool found_own = false;
+
+        r += dr; f += df;
+        while (r >= 0 && r < 8 && f >= 0 && f < 8) {
+            uint8_t sq = static_cast<uint8_t>(r * 8 + f);
+            uint64_t sq_bb = 1ULL << sq;
+
+            if (own_occ & sq_bb) {
+                if (found_own) break; // second own piece, no pin
+                candidate = sq;
+                found_own = true;
+            } else if (opp_occ & sq_bb) {
+                if (found_own && (attackers & sq_bb)) {
+                    // candidate is pinned by this attacker
+                    info.pinned |= 1ULL << candidate;
+                    info.pin_ray[candidate] = (1ULL << sq) | between_bb(info.king_sq, sq) | (1ULL << candidate);
+                }
+                break;
+            }
+
+            r += dr; f += df;
+        }
+    }
+
+    // --- Compute opp_attacks (with our king removed from occupancy) ---
+    uint64_t occ_no_king = all_occ & ~king_bb;
+
+    info.opp_attacks = 0;
+
+    // Opponent pawns
+    uint64_t opp_pawns = state.bitboards[opp_off + PIECE_PAWN];
+    if (opp == COLOR_WHITE) {
+        constexpr uint64_t notA = 0xFEFEFEFEFEFEFEFEULL;
+        constexpr uint64_t notH = 0x7F7F7F7F7F7F7F7FULL;
+        info.opp_attacks |= ((opp_pawns << 7) & notH) | ((opp_pawns << 9) & notA);
+    } else {
+        constexpr uint64_t notA = 0xFEFEFEFEFEFEFEFEULL;
+        constexpr uint64_t notH = 0x7F7F7F7F7F7F7F7FULL;
+        info.opp_attacks |= ((opp_pawns >> 9) & notH) | ((opp_pawns >> 7) & notA);
+    }
+
+    // Opponent knights
+    uint64_t opp_knights = state.bitboards[opp_off + PIECE_KNIGHT];
+    while (opp_knights) {
+        uint8_t sq = pop_lsb(opp_knights);
+        info.opp_attacks |= KNIGHT_ATTACKS[sq];
+    }
+
+    // Opponent king
+    uint8_t opp_king_sq = find_king_square(state, opp);
+    info.opp_attacks |= KING_ATTACKS[opp_king_sq];
+
+    // Opponent bishops + queen (diagonal) - with our king removed
+    uint64_t opp_diag = state.bitboards[opp_off + PIECE_BISHOP] | state.bitboards[opp_off + PIECE_QUEEN];
+    while (opp_diag) {
+        uint8_t sq = pop_lsb(opp_diag);
+        info.opp_attacks |= bishop_attacks(sq, occ_no_king);
+    }
+
+    // Opponent rooks + queen (orthogonal) - with our king removed
+    uint64_t opp_ortho = state.bitboards[opp_off + PIECE_ROOK] | state.bitboards[opp_off + PIECE_QUEEN];
+    while (opp_ortho) {
+        uint8_t sq = pop_lsb(opp_ortho);
+        info.opp_attacks |= rook_attacks(sq, occ_no_king);
+    }
+
+    return info;
+}
+
+// ============================================================
+// Full legal move generation (pin-aware)
+// ============================================================
+
+static inline void add_pawn_moves(std::vector<uint32_t>& moves, uint8_t from, uint8_t to, uint8_t side) {
+    if (is_promotion_square(side, to)) {
+        for (uint8_t p = 1; p <= 4; p++)
+            moves.push_back(encode_ply(from, to, p));
+    } else {
+        moves.push_back(encode_ply(from, to, 0));
+    }
+}
 
 std::vector<uint32_t> generate_legal_moves(const GameState& state) {
     std::vector<uint32_t> moves;
     moves.reserve(256);
 
     uint8_t side = state.sideToMove;
-    uint64_t own_occ = side_occupancy(state, side);
-    uint64_t opp_occ = side_occupancy(state, side ^ 1);
-    uint64_t occ = own_occ | opp_occ;
+    uint8_t opp = side ^ 1;
     uint8_t offset = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (opp == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
 
-    for (int pt = 0; pt < 6; pt++) {
-        uint64_t pieces = state.bitboards[offset + pt];
-        while (pieces) {
-            uint8_t from = pop_lsb(pieces);
-            uint64_t targets = 0;
+    uint64_t own_occ = side_occupancy(state, side);
+    uint64_t opp_occ = side_occupancy(state, opp);
+    uint64_t all_occ = own_occ | opp_occ;
 
-            switch (pt) {
-                case PIECE_PAWN: {
-                    if (side == COLOR_WHITE) {
-                        if (from < 56) {
-                            uint8_t fwd = from + 8;
-                            if (!(occ & (1ULL << fwd))) {
-                                targets |= 1ULL << fwd;
-                                if ((from >> 3) == 1 && !(occ & (1ULL << (from + 16))))
-                                    targets |= 1ULL << (from + 16);
-                            }
-                            if ((from & 7) > 0) targets |= 1ULL << (from + 7);
-                            if ((from & 7) < 7) targets |= 1ULL << (from + 9);
-                        }
-                    } else {
-                        if (from >= 8) {
-                            uint8_t fwd = from - 8;
-                            if (!(occ & (1ULL << fwd))) {
-                                targets |= 1ULL << fwd;
-                                if ((from >> 3) == 6 && !(occ & (1ULL << (from - 16))))
-                                    targets |= 1ULL << (from - 16);
-                            }
-                            if ((from & 7) > 0) targets |= 1ULL << (from - 9);
-                            if ((from & 7) < 7) targets |= 1ULL << (from - 7);
-                        }
-                    }
-                    targets &= ~own_occ;
-                    break;
+    MoveGenInfo info = compute_movegen_info(state);
+    uint8_t king_sq = info.king_sq;
+
+    // --- King moves ---
+    {
+        uint64_t king_targets = KING_ATTACKS[king_sq] & ~own_occ & ~info.opp_attacks;
+        // Also can't capture opponent's king
+        king_targets &= ~state.bitboards[opp_off + PIECE_KING];
+        while (king_targets) {
+            uint8_t to = pop_lsb(king_targets);
+            moves.push_back(encode_ply(king_sq, to, 0));
+        }
+
+        // Castling (only when not in check)
+        if (info.num_checkers == 0) {
+            if (side == COLOR_WHITE) {
+                if (state.castlingRights & 0x01) {
+                    if (can_castle(state, side, king_sq, 6, all_occ))
+                        moves.push_back(encode_ply(king_sq, 6, 0));
                 }
-                case PIECE_KNIGHT:
-                    targets = knight_attacks(from) & ~own_occ;
-                    break;
-                case PIECE_BISHOP:
-                    targets = bishop_attacks(from, occ, own_occ);
-                    break;
-                case PIECE_ROOK:
-                    targets = rook_attacks(from, occ, own_occ);
-                    break;
-                case PIECE_QUEEN:
-                    targets = bishop_attacks(from, occ, own_occ) |
-                              rook_attacks(from, occ, own_occ);
-                    break;
-                case PIECE_KING: {
-                    targets = king_attacks(from) & ~own_occ;
-                    if (side == COLOR_WHITE) {
-                        if (state.castlingRights & 0x01) targets |= 1ULL << 6;
-                        if (state.castlingRights & 0x02) targets |= 1ULL << 2;
-                    } else {
-                        if (state.castlingRights & 0x04) targets |= 1ULL << 62;
-                        if (state.castlingRights & 0x08) targets |= 1ULL << 58;
-                    }
-                    break;
+                if (state.castlingRights & 0x02) {
+                    if (can_castle(state, side, king_sq, 2, all_occ))
+                        moves.push_back(encode_ply(king_sq, 2, 0));
                 }
-            }
-
-            while (targets) {
-                uint8_t to = pop_lsb(targets);
-                if (pt == PIECE_PAWN && is_promotion_square(side, to)) {
-                    // Generate all 4 promotion types
-                    for (uint8_t p = 1; p <= 4; p++) {
-                        uint32_t ply = encode_ply(from, to, p);
-                        if (is_legal_ply(state, ply))
-                            moves.push_back(ply);
-                    }
-                } else {
-                    uint32_t ply = encode_ply(from, to, 0);
-                    if (is_legal_ply(state, ply))
-                        moves.push_back(ply);
+            } else {
+                if (state.castlingRights & 0x04) {
+                    if (can_castle(state, side, king_sq, 62, all_occ))
+                        moves.push_back(encode_ply(king_sq, 62, 0));
+                }
+                if (state.castlingRights & 0x08) {
+                    if (can_castle(state, side, king_sq, 58, all_occ))
+                        moves.push_back(encode_ply(king_sq, 58, 0));
                 }
             }
         }
     }
+
+    // Double check: only king moves
+    if (info.num_checkers >= 2) {
+        return moves;
+    }
+
+    // --- Non-king pieces ---
+    uint64_t check_mask = info.check_mask;
+    uint64_t ep_bb = (state.enPassantSquare != NO_EP) ? (1ULL << state.enPassantSquare) : 0;
+
+    // Pawns
+    {
+        uint64_t pawns = state.bitboards[offset + PIECE_PAWN];
+        while (pawns) {
+            uint8_t from = pop_lsb(pawns);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            // Push moves
+            uint64_t push_targets = 0;
+            if (side == COLOR_WHITE) {
+                uint8_t fwd = from + 8;
+                if (fwd < 64 && !(all_occ & (1ULL << fwd))) {
+                    push_targets |= 1ULL << fwd;
+                    if ((from >> 3) == 1 && !(all_occ & (1ULL << (from + 16))))
+                        push_targets |= 1ULL << (from + 16);
+                }
+            } else {
+                if (from >= 8) {
+                    uint8_t fwd = from - 8;
+                    if (!(all_occ & (1ULL << fwd))) {
+                        push_targets |= 1ULL << fwd;
+                        if ((from >> 3) == 6 && !(all_occ & (1ULL << (from - 16))))
+                            push_targets |= 1ULL << (from - 16);
+                    }
+                }
+            }
+            push_targets &= check_mask & pin_mask;
+
+            while (push_targets) {
+                uint8_t to = pop_lsb(push_targets);
+                add_pawn_moves(moves, from, to, side);
+            }
+
+            // Capture moves (excluding EP)
+            uint64_t capture_targets = PAWN_ATTACKS[side][from] & opp_occ & ~state.bitboards[opp_off + PIECE_KING];
+            capture_targets &= check_mask & pin_mask;
+
+            while (capture_targets) {
+                uint8_t to = pop_lsb(capture_targets);
+                add_pawn_moves(moves, from, to, side);
+            }
+
+            // En passant - ALWAYS use full apply+check
+            if (ep_bb && (PAWN_ATTACKS[side][from] & ep_bb)) {
+                uint8_t ep_to = state.enPassantSquare;
+                uint32_t ply = encode_ply(from, ep_to, 0);
+                if (is_legal_generated(state, ply))
+                    moves.push_back(ply);
+            }
+        }
+    }
+
+    // Knights
+    {
+        uint64_t knights = state.bitboards[offset + PIECE_KNIGHT];
+        while (knights) {
+            uint8_t from = pop_lsb(knights);
+            // Pinned knight can never move legally
+            if (info.pinned & (1ULL << from)) continue;
+
+            uint64_t targets = KNIGHT_ATTACKS[from] & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask;
+            while (targets) {
+                uint8_t to = pop_lsb(targets);
+                moves.push_back(encode_ply(from, to, 0));
+            }
+        }
+    }
+
+    // Bishops
+    {
+        uint64_t bishops = state.bitboards[offset + PIECE_BISHOP];
+        while (bishops) {
+            uint8_t from = pop_lsb(bishops);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            uint64_t targets = bishop_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) {
+                uint8_t to = pop_lsb(targets);
+                moves.push_back(encode_ply(from, to, 0));
+            }
+        }
+    }
+
+    // Rooks
+    {
+        uint64_t rooks = state.bitboards[offset + PIECE_ROOK];
+        while (rooks) {
+            uint8_t from = pop_lsb(rooks);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            uint64_t targets = rook_attacks(from, all_occ) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) {
+                uint8_t to = pop_lsb(targets);
+                moves.push_back(encode_ply(from, to, 0));
+            }
+        }
+    }
+
+    // Queens
+    {
+        uint64_t queens = state.bitboards[offset + PIECE_QUEEN];
+        while (queens) {
+            uint8_t from = pop_lsb(queens);
+            bool is_pinned = (info.pinned & (1ULL << from)) != 0;
+            uint64_t pin_mask = is_pinned ? info.pin_ray[from] : ~0ULL;
+
+            uint64_t targets = (bishop_attacks(from, all_occ) | rook_attacks(from, all_occ)) & ~own_occ & ~state.bitboards[opp_off + PIECE_KING] & check_mask & pin_mask;
+            while (targets) {
+                uint8_t to = pop_lsb(targets);
+                moves.push_back(encode_ply(from, to, 0));
+            }
+        }
+    }
+
     return moves;
 }
 
