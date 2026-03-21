@@ -326,6 +326,10 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
     IntegerVector pieces_defended(n);
     IntegerVector pawn_chain_length(n);
     IntegerVector pawn_islands(n);
+    // Evaluative features: quality of available captures, not just counts
+    IntegerVector best_capture_net(n);      // max(captured - moved) across all legal captures
+    IntegerVector num_safe_sacrifices(n);   // sacrifices where opponent can't recapture
+    IntegerVector opp_recapture_after_move(n); // can opponent recapture the moved piece?
 
     for (int i = 0; i < n; i++) {
         chess::GameState state = chess::parse_fen(as<std::string>(fens[i]));
@@ -684,6 +688,8 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             bool castle_ok = false;
             int mob[6] = {0, 0, 0, 0, 0, 0};
             bool promo_av = false;
+            int best_cap_net = -99;  // best (captured - moved) across all captures
+            int n_safe_sac = 0;     // sacrifices where opponent can't recapture
             for (auto m : moves) {
                 uint8_t mf, mt, mp;
                 chess::decode_ply(m, mf, mt, mp);
@@ -717,11 +723,20 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
                     for (int j = 0; j < 6; j++) {
                         if (state.bitboards[offset + j] & mf_mask) { mv = vals[j]; break; }
                     }
+                    // Track best net capture value (evaluative)
+                    int net = cv - mv;
+                    if (net > best_cap_net) best_cap_net = net;
+
                     if (mv > cv) {
                         // Sacrifice: giving up more than gaining
                         n_sac++;
                         int gap = mv - cv;
                         if (gap > max_sac_gap) max_sac_gap = gap;
+                        // Check if opponent can recapture on destination square
+                        chess::GameState sac_next = chess::apply_ply_to_memory(state, m);
+                        if (!chess::is_square_attacked(sac_next, mt, sac_next.sideToMove)) {
+                            n_safe_sac++;  // opponent can't recapture — "free" sacrifice
+                        }
                     } else {
                         // Equal or winning capture
                         n_win_cap++;
@@ -743,6 +758,13 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             num_sacrifices_avail[i] = n_sac;
             num_winning_caps_avail[i] = n_win_cap;
             max_sacrifice_gap[i] = max_sac_gap;
+            best_capture_net[i] = (best_cap_net > -99) ? best_cap_net : 0;
+            num_safe_sacrifices[i] = n_safe_sac;
+            // Can opponent recapture the piece we just moved?
+            // next state already computed; opponent = next.sideToMove
+            opp_recapture_after_move[i] =
+                chess::is_square_attacked(next, to, next.sideToMove)
+                ? moved_piece_value[i] : 0;
             mob_pawn[i]   = mob[0]; mob_knight[i] = mob[1]; mob_bishop[i] = mob[2];
             mob_rook[i]   = mob[3]; mob_queen[i]  = mob[4]; mob_king[i]   = mob[5];
             promotion_available[i] = promo_av;
@@ -766,6 +788,9 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             mob_pawn[i] = 0; mob_knight[i] = 0; mob_bishop[i] = 0;
             mob_rook[i] = 0; mob_queen[i]  = 0; mob_king[i]  = 0;
             promotion_available[i] = false;
+            best_capture_net[i] = 0;
+            num_safe_sacrifices[i] = 0;
+            opp_recapture_after_move[i] = 0;
         }
     }
 
@@ -812,6 +837,9 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
         Named("pieces_defended")          = pieces_defended,
         Named("pawn_chain_length")        = pawn_chain_length,
         Named("pawn_islands")             = pawn_islands,
+        Named("best_capture_net")         = best_capture_net,
+        Named("num_safe_sacrifices")      = num_safe_sacrifices,
+        Named("opp_recapture_after_move") = opp_recapture_after_move,
         Named("stringsAsFactors") = false
     );
 }
