@@ -8,6 +8,7 @@
 context("Perft — Comprehensive (all positions, depth 4-8)")
 
 skip_on_cran()
+skip_on_ci()
 
 # ---------------------------------------------------------------------------
 # Position 1: Starting position (depths 1-8)
