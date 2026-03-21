@@ -17,7 +17,7 @@ implemented in C++17 via Rcpp. The package exposes two layers:
 }
 }
 \author{
-\strong{Maintainer}: Qusai Jouda \email{qjouda@gmu.edu}
+\strong{Maintainer}: Qusai Jouda \email{jouda.qusai@gmail.com}
 
 }
 \keyword{internal}

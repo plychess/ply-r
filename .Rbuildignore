@@ -10,3 +10,15 @@
 ^src/.*\.o$
 ^src/.*\.so$
 ^\.github$
+^\.claude$
+^bench$
+^debug_errors.*\.R$
+^bench_nps\.R$
+^perft_bench$
+^perft_depth6$
+^perft_native$
+^full_summary$
+^full_summary_pgo$
+^pgnmentor$
+^ply-source-tarball\.zip$
+^cran-comments\.md$

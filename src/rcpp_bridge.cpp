@@ -62,7 +62,123 @@ static List state_to_list(const chess::GameState& s) {
 }
 
 // ============================================================
-// Engine functions exposed to R
+// External pointer API (zero-copy GameState passing)
+// ============================================================
+
+// Destructor called when R garbage-collects the external pointer
+static void gamestate_finalizer(chess::GameState* p) { delete p; }
+
+// Wrap a GameState in an R external pointer
+static SEXP wrap_state(chess::GameState* s) {
+    Rcpp::XPtr<chess::GameState> ptr(s, true); // true = register destructor
+    ptr.attr("class") = "ChessStateXPtr";
+    return ptr;
+}
+
+// Unwrap: get C++ pointer from R external pointer
+static chess::GameState& unwrap_state(SEXP xp) {
+    Rcpp::XPtr<chess::GameState> ptr(xp);
+    return *ptr;
+}
+
+// Accepts either a List (old API) or external pointer (new API)
+static chess::GameState any_to_state(SEXP x) {
+    if (TYPEOF(x) == EXTPTRSXP) {
+        return unwrap_state(x);
+    }
+    return list_to_state(as<List>(x));
+}
+
+// [[Rcpp::export]]
+SEXP cpp_xp_init_game() {
+    auto* s = new chess::GameState();
+    chess::init_game(*s);
+    return wrap_state(s);
+}
+
+// [[Rcpp::export]]
+SEXP cpp_xp_parse_fen(std::string fen) {
+    auto* s = new chess::GameState(chess::parse_fen(fen));
+    return wrap_state(s);
+}
+
+// [[Rcpp::export]]
+std::string cpp_xp_state_to_fen(SEXP state) {
+    return chess::state_to_fen(any_to_state(state));
+}
+
+// [[Rcpp::export]]
+bool cpp_xp_in_check(SEXP state, int color) {
+    return chess::in_check(any_to_state(state), static_cast<uint8_t>(color));
+}
+
+// [[Rcpp::export]]
+bool cpp_xp_is_legal_ply(SEXP state, int ply) {
+    return chess::is_legal_ply(any_to_state(state), static_cast<uint32_t>(ply));
+}
+
+// [[Rcpp::export]]
+SEXP cpp_xp_apply_ply(SEXP state, int ply) {
+    chess::GameState s = any_to_state(state);
+    auto* next = new chess::GameState(chess::apply_ply_memory(s, static_cast<uint32_t>(ply)));
+    return wrap_state(next);
+}
+
+// [[Rcpp::export]]
+IntegerVector cpp_xp_generate_legal_moves(SEXP state) {
+    chess::GameState s = any_to_state(state);
+    std::vector<uint32_t> moves = chess::generate_legal_moves(s);
+    IntegerVector result(moves.size());
+    for (size_t i = 0; i < moves.size(); i++) result[i] = static_cast<int>(moves[i]);
+    return result;
+}
+
+// [[Rcpp::export]]
+int cpp_xp_count_legal_moves(SEXP state) {
+    return chess::count_legal_moves(any_to_state(state));
+}
+
+// [[Rcpp::export]]
+bool cpp_xp_is_insufficient_material(SEXP state) {
+    return chess::is_insufficient_material(any_to_state(state));
+}
+
+// [[Rcpp::export]]
+bool cpp_xp_validate_position(SEXP state) {
+    return chess::validate_position(any_to_state(state));
+}
+
+// [[Rcpp::export]]
+std::string cpp_xp_position_hash(SEXP state) {
+    chess::GameState s = any_to_state(state);
+    char buf[20];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)s.hash);
+    return std::string(buf);
+}
+
+// [[Rcpp::export]]
+int cpp_xp_perft(std::string fen, int depth) {
+    chess::init_attack_tables();
+    chess::GameState state = chess::parse_fen(fen);
+    // Simple perft for R use — single-threaded, no TT
+    std::function<uint64_t(const chess::GameState&, int)> perft =
+        [&](const chess::GameState& s, int d) -> uint64_t {
+        if (d == 0) return 1ULL;
+        if (d == 1) return static_cast<uint64_t>(chess::count_legal_moves(s));
+        uint32_t moves[256];
+        int count = chess::generate_legal_moves_fast(s, moves);
+        uint64_t total = 0;
+        for (int i = 0; i < count; i++) {
+            chess::GameState child = chess::apply_ply_to_memory(s, moves[i]);
+            total += perft(child, d - 1);
+        }
+        return total;
+    };
+    return static_cast<int>(perft(state, depth));
+}
+
+// ============================================================
+// Engine functions exposed to R (legacy list-based API)
 // ============================================================
 
 // [[Rcpp::export]]
@@ -178,6 +294,13 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
     IntegerVector doubled_pawns(n), isolated_pawns(n), passed_pawns(n);
     IntegerVector pin_count(n);
     LogicalVector en_passant_avail(n), promotion_available(n);
+    // Style analysis features
+    IntegerVector center_occupied(n), center_attacked(n);
+    IntegerVector undeveloped_minors(n);
+    IntegerVector space_advantage(n);
+    IntegerVector pieces_defended(n);
+    IntegerVector pawn_chain_length(n);
+    IntegerVector pawn_islands(n);
 
     for (int i = 0; i < n; i++) {
         chess::GameState state = chess::parse_fen(as<std::string>(fens[i]));
@@ -318,6 +441,133 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             doubled_pawns[i]  = dbl;
             isolated_pawns[i] = iso;
             passed_pawns[i]   = passed;
+        }
+
+        // Center control: e4=28, d4=27, e5=36, d5=35
+        {
+            static const uint8_t CENTER[4] = {27, 28, 35, 36};
+            static const uint64_t CENTER_BB = (1ULL << 27) | (1ULL << 28) | (1ULL << 35) | (1ULL << 36);
+            int occ = chess::popcount(own_occ & CENTER_BB);
+            int atk = 0;
+            for (int c = 0; c < 4; c++) {
+                if (chess::is_square_attacked(state, CENTER[c], state.sideToMove)) atk++;
+            }
+            center_occupied[i] = occ;
+            center_attacked[i] = atk;
+        }
+
+        // Development: minor pieces still on starting squares
+        {
+            int undev = 0;
+            if (state.sideToMove == chess::COLOR_WHITE) {
+                // Nb1=1, Bc1=2, Bf1=5, Ng1=6
+                if (state.bitboards[chess::WHITE_OFFSET + chess::PIECE_KNIGHT] & (1ULL << 1)) undev++;
+                if (state.bitboards[chess::WHITE_OFFSET + chess::PIECE_KNIGHT] & (1ULL << 6)) undev++;
+                if (state.bitboards[chess::WHITE_OFFSET + chess::PIECE_BISHOP] & (1ULL << 2)) undev++;
+                if (state.bitboards[chess::WHITE_OFFSET + chess::PIECE_BISHOP] & (1ULL << 5)) undev++;
+            } else {
+                // Nb8=57, Bc8=58, Bf8=61, Ng8=62
+                if (state.bitboards[chess::BLACK_OFFSET + chess::PIECE_KNIGHT] & (1ULL << 57)) undev++;
+                if (state.bitboards[chess::BLACK_OFFSET + chess::PIECE_KNIGHT] & (1ULL << 62)) undev++;
+                if (state.bitboards[chess::BLACK_OFFSET + chess::PIECE_BISHOP] & (1ULL << 58)) undev++;
+                if (state.bitboards[chess::BLACK_OFFSET + chess::PIECE_BISHOP] & (1ULL << 61)) undev++;
+            }
+            undeveloped_minors[i] = undev;
+        }
+
+        // Space advantage: squares attacked on opponent's half
+        {
+            // White attacks ranks 5-8 (sq 32-63), Black attacks ranks 1-4 (sq 0-31)
+            uint64_t enemy_half = (state.sideToMove == chess::COLOR_WHITE)
+                ? 0xFFFFFFFF00000000ULL   // ranks 5-8
+                : 0x00000000FFFFFFFFULL;  // ranks 1-4
+            int space = 0;
+            uint64_t sq_mask = enemy_half;
+            while (sq_mask) {
+                uint8_t sq = chess::pop_lsb(sq_mask);
+                if (chess::is_square_attacked(state, sq, state.sideToMove)) space++;
+            }
+            space_advantage[i] = space;
+        }
+
+        // Piece coordination: own pieces defended by at least one friendly piece
+        {
+            uint64_t own_no_king = own_occ & ~state.bitboards[offset + chess::PIECE_KING];
+            int defended = 0;
+            uint64_t pieces = own_no_king;
+            while (pieces) {
+                uint8_t sq = chess::pop_lsb(pieces);
+                if (chess::is_square_attacked(state, sq, state.sideToMove)) defended++;
+            }
+            pieces_defended[i] = defended;
+        }
+
+        // Pawn chain: longest diagonal chain of own pawns supporting each other
+        {
+            uint64_t own_pawns = state.bitboards[offset + chess::PIECE_PAWN];
+            int max_chain = 0;
+            uint64_t pawns = own_pawns;
+            while (pawns) {
+                uint8_t sq = chess::pop_lsb(pawns);
+                // Walk up the chain from this pawn
+                int chain = 1;
+                uint8_t cur = sq;
+                if (state.sideToMove == chess::COLOR_WHITE) {
+                    // Walk NE: +9 (if file < 7), or NW: +7 (if file > 0)
+                    // Try both directions, take longest
+                    for (int dir = 0; dir < 2; dir++) {
+                        int len = 1;
+                        uint8_t c = sq;
+                        while (true) {
+                            uint8_t f = c & 7;
+                            uint8_t next = (dir == 0) ? c + 9 : c + 7;
+                            if (dir == 0 && f >= 7) break;
+                            if (dir == 1 && f <= 0) break;
+                            if (next >= 64) break;
+                            if (own_pawns & (1ULL << next)) { len++; c = next; }
+                            else break;
+                        }
+                        if (len > chain) chain = len;
+                    }
+                } else {
+                    // Black: walk SE (-7) or SW (-9)
+                    for (int dir = 0; dir < 2; dir++) {
+                        int len = 1;
+                        uint8_t c = sq;
+                        while (true) {
+                            uint8_t f = c & 7;
+                            int next = (dir == 0) ? (int)c - 7 : (int)c - 9;
+                            if (dir == 0 && f >= 7) break;
+                            if (dir == 1 && f <= 0) break;
+                            if (next < 0) break;
+                            if (own_pawns & (1ULL << next)) { len++; c = (uint8_t)next; }
+                            else break;
+                        }
+                        if (len > chain) chain = len;
+                    }
+                }
+                if (chain > max_chain) max_chain = chain;
+            }
+            pawn_chain_length[i] = max_chain;
+        }
+
+        // Pawn islands: count disconnected groups of pawns on adjacent files
+        {
+            static const uint64_t FILE_BB[8] = {
+                0x0101010101010101ULL, 0x0202020202020202ULL,
+                0x0404040404040404ULL, 0x0808080808080808ULL,
+                0x1010101010101010ULL, 0x2020202020202020ULL,
+                0x4040404040404040ULL, 0x8080808080808080ULL
+            };
+            uint64_t own_pawns = state.bitboards[offset + chess::PIECE_PAWN];
+            int islands = 0;
+            bool prev_has = false;
+            for (int f = 0; f < 8; f++) {
+                bool has = (own_pawns & FILE_BB[f]) != 0;
+                if (has && !prev_has) islands++;
+                prev_has = has;
+            }
+            pawn_islands[i] = islands;
         }
 
         // En passant square available before this move
@@ -530,6 +780,13 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
         Named("pin_count")                = pin_count,
         Named("en_passant_avail")         = en_passant_avail,
         Named("promotion_available")      = promotion_available,
+        Named("center_occupied")          = center_occupied,
+        Named("center_attacked")          = center_attacked,
+        Named("undeveloped_minors")       = undeveloped_minors,
+        Named("space_advantage")          = space_advantage,
+        Named("pieces_defended")          = pieces_defended,
+        Named("pawn_chain_length")        = pawn_chain_length,
+        Named("pawn_islands")             = pawn_islands,
         Named("stringsAsFactors") = false
     );
 }
