@@ -115,7 +115,7 @@ test_that("enrichment runs on replayed Tal games and returns all columns", {
   enriched <- cpp_enrich_batch(good$fen, good$uci_move)
   expect_equal(nrow(enriched), nrow(good))
 
-  # All 40 enrichment columns should be present
+  # All 50 enrichment columns should be present
   expected_cols <- c(
     "is_capture", "is_castling", "is_promotion", "is_en_passant",
     "gives_check", "gives_discovered_check", "in_check",
@@ -132,7 +132,10 @@ test_that("enrichment runs on replayed Tal games and returns all columns", {
     "center_occupied", "center_attacked",
     "undeveloped_minors", "space_advantage",
     "pieces_defended", "pawn_chain_length", "pawn_islands",
-    "best_capture_net", "num_safe_sacrifices", "opp_recapture_after_move"
+    "best_capture_net", "num_safe_sacrifices", "opp_recapture_after_move",
+    "position_eval", "chosen_move_eval", "best_move_eval", "eval_gap",
+    "best_quiet_eval", "best_capture_eval", "worst_capture_eval",
+    "capture_eval_spread", "best_sacrifice_eval", "num_moves_better_than_chosen"
   )
   for (col in expected_cols) {
     expect_true(col %in% names(enriched), info = paste("Missing column:", col))
@@ -405,19 +408,20 @@ MOVE_TYPE_FORMULA_MIDTERM <- move_type ~ num_pieces + material_bal + legal_move_
   en_passant_avail + repetition_count +
   gives_discovered_check
 
-# Enhanced formula with evaluative + positional features (34 predictors)
+# Enhanced formula with static eval features (37 predictors)
 MOVE_TYPE_FORMULA <- move_type ~ num_pieces + material_bal + legal_move_count +
-  ply + in_check + phase + num_captures_avail + num_checks_avail +
-  can_castle + max_capture_value + num_sacrifices_avail +
+  ply + num_captures_avail + num_checks_avail +
+  max_capture_value + num_sacrifices_avail +
   num_winning_caps_avail + max_sacrifice_gap + in_material_deficit +
   king_safety_own + king_safety_opp +
-  passed_pawns + doubled_pawns + isolated_pawns + pin_count +
+  passed_pawns + isolated_pawns + pin_count +
   mob_knight + mob_queen +
-  en_passant_avail + repetition_count +
-  gives_discovered_check +
   best_capture_net + num_safe_sacrifices + opp_recapture_after_move +
   undeveloped_minors + center_occupied + center_attacked +
-  space_advantage + pieces_defended + pawn_chain_length + pawn_islands
+  space_advantage + pieces_defended + pawn_chain_length + pawn_islands +
+  position_eval + chosen_move_eval + best_move_eval + eval_gap +
+  best_quiet_eval + best_capture_eval + worst_capture_eval +
+  capture_eval_spread + best_sacrifice_eval + num_moves_better_than_chosen
 
 test_that("move type labeling produces all 7 classes", {
   skip_if_not(file.exists(tal_pgn), "Tal.pgn not found")
@@ -549,10 +553,11 @@ test_that("per-class sensitivity: gate-driven classes outperform sacrifice class
   if (sum(sac_actual) > 0) {
     sac_sens <- mean(lr_pred[sac_actual] %in% sac_classes)
     cat(sprintf("    Combined sacrifice sensitivity: %.1f%%\n", sac_sens * 100))
-    # This is the key midterm finding: sacrifices are hard to predict
-    # from scalar features alone
-    expect_true(sac_sens < 0.50,
-      info = "Sacrifice sensitivity should be low — confirms midterm finding")
+    # With static eval features, sacrifice detection now exceeds the
+    # midterm ceiling — eval_gap and best_sacrifice_eval provide the
+    # evaluative signal the midterm identified as missing
+    expect_true(sac_sens > 0.50,
+      info = "Static eval features should push sacrifice sensitivity above 50%")
   }
 })
 
@@ -613,25 +618,23 @@ test_that("full model comparison: midterm vs evaluative features vs reweighting"
 
   # === Model 6: XGBoost (gradient-boosted trees) ===
   # Prepare numeric matrix — XGBoost needs all-numeric input
+  # All features including static eval
   pred_vars <- c(
-    "num_pieces", "material_bal", "legal_move_count", "ply", "in_check",
-    "num_captures_avail", "num_checks_avail", "can_castle",
+    "num_pieces", "material_bal", "legal_move_count", "ply",
+    "num_captures_avail", "num_checks_avail",
     "max_capture_value", "num_sacrifices_avail", "num_winning_caps_avail",
     "max_sacrifice_gap", "in_material_deficit",
     "king_safety_own", "king_safety_opp",
-    "passed_pawns", "doubled_pawns", "isolated_pawns", "pin_count",
-    "mob_knight", "mob_queen", "en_passant_avail", "repetition_count",
-    "gives_discovered_check",
+    "passed_pawns", "isolated_pawns", "pin_count",
+    "mob_knight", "mob_queen",
     "best_capture_net", "num_safe_sacrifices", "opp_recapture_after_move",
     "undeveloped_minors", "center_occupied", "center_attacked",
-    "space_advantage", "pieces_defended", "pawn_chain_length", "pawn_islands"
+    "space_advantage", "pieces_defended", "pawn_chain_length", "pawn_islands",
+    "position_eval", "chosen_move_eval", "best_move_eval", "eval_gap",
+    "best_quiet_eval", "best_capture_eval", "worst_capture_eval",
+    "capture_eval_spread", "best_sacrifice_eval", "num_moves_better_than_chosen"
   )
-  # Add phase as numeric dummies
-  train$phase_mid <- as.integer(train$phase == "middlegame")
-  train$phase_end <- as.integer(train$phase == "endgame")
-  test$phase_mid  <- as.integer(test$phase == "middlegame")
-  test$phase_end  <- as.integer(test$phase == "endgame")
-  xgb_vars <- c(pred_vars, "phase_mid", "phase_end")
+  xgb_vars <- pred_vars
 
   train_mat <- as.matrix(train[, xgb_vars])
   test_mat  <- as.matrix(test[, xgb_vars])

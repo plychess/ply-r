@@ -330,6 +330,17 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
     IntegerVector best_capture_net(n);      // max(captured - moved) across all legal captures
     IntegerVector num_safe_sacrifices(n);   // sacrifices where opponent can't recapture
     IntegerVector opp_recapture_after_move(n); // can opponent recapture the moved piece?
+    // Static evaluation features (centipawns)
+    IntegerVector position_eval(n);             // eval of current position before move
+    IntegerVector chosen_move_eval(n);          // eval after Tal's actual move
+    IntegerVector best_move_eval(n);            // eval after objectively best move
+    IntegerVector eval_gap(n);                  // best_move_eval - chosen_move_eval
+    IntegerVector best_quiet_eval(n);           // eval after best non-capture move
+    IntegerVector best_capture_eval(n);         // eval after best capture
+    IntegerVector worst_capture_eval(n);        // eval after worst capture
+    IntegerVector capture_eval_spread(n);       // best_capture_eval - worst_capture_eval
+    IntegerVector best_sacrifice_eval(n);       // eval after best sacrifice
+    IntegerVector num_moves_better_than_chosen(n); // moves scoring higher than Tal's choice
 
     for (int i = 0; i < n; i++) {
         chess::GameState state = chess::parse_fen(as<std::string>(fens[i]));
@@ -682,6 +693,12 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             auto moves = chess::generate_legal_moves(state);
             legal_move_count[i] = static_cast<int>(moves.size());
 
+            // Static eval of current position and chosen move
+            int sign = (state.sideToMove == chess::COLOR_WHITE) ? 1 : -1;
+            position_eval[i] = sign * chess::evaluate(state);
+            int chosen_eval = sign * chess::evaluate(next) * -1; // next has flipped side
+            chosen_move_eval[i] = chosen_eval;
+
             // Count available move types across all legal moves
             int nc = 0, nchk = 0, mcv = 0;
             int n_sac = 0, n_win_cap = 0, max_sac_gap = 0;
@@ -690,6 +707,12 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             bool promo_av = false;
             int best_cap_net = -99;  // best (captured - moved) across all captures
             int n_safe_sac = 0;     // sacrifices where opponent can't recapture
+            // Eval tracking across all legal moves
+            int best_eval = -999999, best_quiet = -999999;
+            int best_cap_ev = -999999, worst_cap_ev = 999999;
+            int best_sac_ev = -999999;
+            int n_better = 0;
+            bool any_cap = false, any_sac = false;
             for (auto m : moves) {
                 uint8_t mf, mt, mp;
                 chess::decode_ply(m, mf, mt, mp);
@@ -750,6 +773,35 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
                 // Check?
                 chess::GameState ns = chess::apply_ply_to_memory(state, m);
                 if (chess::in_check(ns, ns.sideToMove)) nchk++;
+
+                // Evaluate this move (from mover's perspective)
+                int mv_eval = sign * chess::evaluate(ns) * -1;
+                if (mv_eval > best_eval) best_eval = mv_eval;
+                if (mv_eval > chosen_eval) n_better++;
+                if (cap) {
+                    any_cap = true;
+                    if (mv_eval > best_cap_ev) best_cap_ev = mv_eval;
+                    if (mv_eval < worst_cap_ev) worst_cap_ev = mv_eval;
+                    // Check if this is a sacrifice capture
+                    int mv_val = 0;
+                    for (int j = 0; j < 6; j++) {
+                        if (state.bitboards[offset + j] & mf_mask) { mv_val = vals[j]; break; }
+                    }
+                    int cv_val = 0;
+                    if (is_pawn && mt == state.enPassantSquare && state.enPassantSquare != chess::NO_EP) {
+                        cv_val = 1;
+                    } else {
+                        for (int j = 0; j < 6; j++) {
+                            if (state.bitboards[opp_offset + j] & mt_mask) { cv_val = vals[j]; break; }
+                        }
+                    }
+                    if (mv_val > cv_val) {
+                        any_sac = true;
+                        if (mv_eval > best_sac_ev) best_sac_ev = mv_eval;
+                    }
+                } else {
+                    if (mv_eval > best_quiet) best_quiet = mv_eval;
+                }
             }
             num_captures_avail[i] = nc;
             num_checks_avail[i] = nchk;
@@ -768,6 +820,16 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             mob_pawn[i]   = mob[0]; mob_knight[i] = mob[1]; mob_bishop[i] = mob[2];
             mob_rook[i]   = mob[3]; mob_queen[i]  = mob[4]; mob_king[i]   = mob[5];
             promotion_available[i] = promo_av;
+
+            // Assign eval features
+            best_move_eval[i] = best_eval;
+            eval_gap[i] = best_eval - chosen_eval;
+            best_quiet_eval[i] = (best_quiet > -999999) ? best_quiet : chosen_eval;
+            best_capture_eval[i] = any_cap ? best_cap_ev : 0;
+            worst_capture_eval[i] = any_cap ? worst_cap_ev : 0;
+            capture_eval_spread[i] = any_cap ? (best_cap_ev - worst_cap_ev) : 0;
+            best_sacrifice_eval[i] = any_sac ? best_sac_ev : 0;
+            num_moves_better_than_chosen[i] = n_better;
 
             // Check for checkmate/stalemate AFTER the move
             auto r = chess::has_any_legal_ply_with_check(next);
@@ -791,6 +853,16 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
             best_capture_net[i] = 0;
             num_safe_sacrifices[i] = 0;
             opp_recapture_after_move[i] = 0;
+            position_eval[i] = 0;
+            chosen_move_eval[i] = 0;
+            best_move_eval[i] = 0;
+            eval_gap[i] = 0;
+            best_quiet_eval[i] = 0;
+            best_capture_eval[i] = 0;
+            worst_capture_eval[i] = 0;
+            capture_eval_spread[i] = 0;
+            best_sacrifice_eval[i] = 0;
+            num_moves_better_than_chosen[i] = 0;
         }
     }
 
@@ -840,6 +912,16 @@ DataFrame cpp_enrich_batch(CharacterVector fens, CharacterVector uci_moves) {
         Named("best_capture_net")         = best_capture_net,
         Named("num_safe_sacrifices")      = num_safe_sacrifices,
         Named("opp_recapture_after_move") = opp_recapture_after_move,
+        Named("position_eval")            = position_eval,
+        Named("chosen_move_eval")         = chosen_move_eval,
+        Named("best_move_eval")           = best_move_eval,
+        Named("eval_gap")                 = eval_gap,
+        Named("best_quiet_eval")          = best_quiet_eval,
+        Named("best_capture_eval")        = best_capture_eval,
+        Named("worst_capture_eval")       = worst_capture_eval,
+        Named("capture_eval_spread")      = capture_eval_spread,
+        Named("best_sacrifice_eval")      = best_sacrifice_eval,
+        Named("num_moves_better_than_chosen") = num_moves_better_than_chosen,
         Named("stringsAsFactors") = false
     );
 }

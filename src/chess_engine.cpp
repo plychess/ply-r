@@ -1922,4 +1922,106 @@ uint64_t position_hash(const GameState& state) {
     return h;
 }
 
+// ============================================================
+// Static evaluation (centipawns, from White's perspective)
+// ============================================================
+
+// Piece-square tables: bonus/penalty per square for each piece type.
+// Indexed [square] where square = rank*8 + file (a1=0, h8=63).
+// Values from White's perspective; flipped for Black.
+
+static const int PST_PAWN[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5,  5, 10, 25, 25, 10,  5,  5,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    50, 50, 50, 50, 50, 50, 50, 50,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+
+static const int PST_KNIGHT[64] = {
+   -50,-40,-30,-30,-30,-30,-40,-50,
+   -40,-20,  0,  5,  5,  0,-20,-40,
+   -30,  0, 10, 15, 15, 10,  0,-30,
+   -30,  5, 15, 20, 20, 15,  5,-30,
+   -30,  0, 15, 20, 20, 15,  0,-30,
+   -30,  5, 10, 15, 15, 10,  5,-30,
+   -40,-20,  0,  0,  0,  0,-20,-40,
+   -50,-40,-30,-30,-30,-30,-40,-50
+};
+
+static const int PST_BISHOP[64] = {
+   -20,-10,-10,-10,-10,-10,-10,-20,
+   -10,  5,  0,  0,  0,  0,  5,-10,
+   -10, 10, 10, 10, 10, 10, 10,-10,
+   -10,  0, 10, 10, 10, 10,  0,-10,
+   -10,  5,  5, 10, 10,  5,  5,-10,
+   -10,  0,  5, 10, 10,  5,  0,-10,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -20,-10,-10,-10,-10,-10,-10,-20
+};
+
+static const int PST_ROOK[64] = {
+     0,  0,  0,  5,  5,  0,  0,  0,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+     5, 10, 10, 10, 10, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+
+static const int PST_QUEEN[64] = {
+   -20,-10,-10, -5, -5,-10,-10,-20,
+   -10,  0,  5,  0,  0,  0,  0,-10,
+   -10,  5,  5,  5,  5,  5,  0,-10,
+     0,  0,  5,  5,  5,  5,  0, -5,
+    -5,  0,  5,  5,  5,  5,  0, -5,
+   -10,  0,  5,  5,  5,  5,  0,-10,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -20,-10,-10, -5, -5,-10,-10,-20
+};
+
+static const int PST_KING[64] = {
+    20, 30, 10,  0,  0, 10, 30, 20,
+    20, 20,  0,  0,  0,  0, 20, 20,
+   -10,-20,-20,-20,-20,-20,-20,-10,
+   -20,-30,-30,-40,-40,-30,-30,-20,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30
+};
+
+static const int* PST_ALL[6] = {
+    PST_PAWN, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING
+};
+
+static const int PIECE_VALUES_CP[6] = { 100, 320, 330, 500, 900, 20000 };
+
+int evaluate(const GameState& state) {
+    int score = 0;
+
+    for (int p = 0; p < 6; p++) {
+        // White pieces
+        uint64_t bb = state.bitboards[WHITE_OFFSET + p];
+        while (bb) {
+            uint8_t sq = pop_lsb(bb);
+            score += PIECE_VALUES_CP[p] + PST_ALL[p][sq];
+        }
+        // Black pieces — mirror the PST (flip rank)
+        bb = state.bitboards[BLACK_OFFSET + p];
+        while (bb) {
+            uint8_t sq = pop_lsb(bb);
+            uint8_t mirrored = (7 - (sq >> 3)) * 8 + (sq & 7); // flip rank
+            score -= PIECE_VALUES_CP[p] + PST_ALL[p][mirrored];
+        }
+    }
+
+    return score;
+}
+
 } // namespace chess

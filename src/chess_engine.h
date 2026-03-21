@@ -202,6 +202,9 @@ std::string ply_to_uci(uint32_t ply);
 // Position hashing (for repetition)
 uint64_t position_hash(const GameState& state);
 
+// Static evaluation (centipawns, from White's perspective)
+int evaluate(const GameState& state);
+
 } // namespace chess
 
 #endif // CHESS_ENGINE_H
