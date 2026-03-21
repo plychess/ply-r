@@ -10,6 +10,141 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// cpp_xp_init_game
+SEXP cpp_xp_init_game();
+RcppExport SEXP _ply_cpp_xp_init_game() {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_init_game());
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_parse_fen
+SEXP cpp_xp_parse_fen(std::string fen);
+RcppExport SEXP _ply_cpp_xp_parse_fen(SEXP fenSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type fen(fenSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_parse_fen(fen));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_state_to_fen
+std::string cpp_xp_state_to_fen(SEXP state);
+RcppExport SEXP _ply_cpp_xp_state_to_fen(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_state_to_fen(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_in_check
+bool cpp_xp_in_check(SEXP state, int color);
+RcppExport SEXP _ply_cpp_xp_in_check(SEXP stateSEXP, SEXP colorSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    Rcpp::traits::input_parameter< int >::type color(colorSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_in_check(state, color));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_is_legal_ply
+bool cpp_xp_is_legal_ply(SEXP state, int ply);
+RcppExport SEXP _ply_cpp_xp_is_legal_ply(SEXP stateSEXP, SEXP plySEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    Rcpp::traits::input_parameter< int >::type ply(plySEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_is_legal_ply(state, ply));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_apply_ply
+SEXP cpp_xp_apply_ply(SEXP state, int ply);
+RcppExport SEXP _ply_cpp_xp_apply_ply(SEXP stateSEXP, SEXP plySEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    Rcpp::traits::input_parameter< int >::type ply(plySEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_apply_ply(state, ply));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_generate_legal_moves
+IntegerVector cpp_xp_generate_legal_moves(SEXP state);
+RcppExport SEXP _ply_cpp_xp_generate_legal_moves(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_generate_legal_moves(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_count_legal_moves
+int cpp_xp_count_legal_moves(SEXP state);
+RcppExport SEXP _ply_cpp_xp_count_legal_moves(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_count_legal_moves(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_is_insufficient_material
+bool cpp_xp_is_insufficient_material(SEXP state);
+RcppExport SEXP _ply_cpp_xp_is_insufficient_material(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_is_insufficient_material(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_validate_position
+bool cpp_xp_validate_position(SEXP state);
+RcppExport SEXP _ply_cpp_xp_validate_position(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_validate_position(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_position_hash
+std::string cpp_xp_position_hash(SEXP state);
+RcppExport SEXP _ply_cpp_xp_position_hash(SEXP stateSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type state(stateSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_position_hash(state));
+    return rcpp_result_gen;
+END_RCPP
+}
+// cpp_xp_perft
+int cpp_xp_perft(std::string fen, int depth);
+RcppExport SEXP _ply_cpp_xp_perft(SEXP fenSEXP, SEXP depthSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type fen(fenSEXP);
+    Rcpp::traits::input_parameter< int >::type depth(depthSEXP);
+    rcpp_result_gen = Rcpp::wrap(cpp_xp_perft(fen, depth));
+    return rcpp_result_gen;
+END_RCPP
+}
 // cpp_init_game
 List cpp_init_game();
 RcppExport SEXP _ply_cpp_init_game() {
@@ -392,6 +527,18 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_ply_cpp_xp_init_game", (DL_FUNC) &_ply_cpp_xp_init_game, 0},
+    {"_ply_cpp_xp_parse_fen", (DL_FUNC) &_ply_cpp_xp_parse_fen, 1},
+    {"_ply_cpp_xp_state_to_fen", (DL_FUNC) &_ply_cpp_xp_state_to_fen, 1},
+    {"_ply_cpp_xp_in_check", (DL_FUNC) &_ply_cpp_xp_in_check, 2},
+    {"_ply_cpp_xp_is_legal_ply", (DL_FUNC) &_ply_cpp_xp_is_legal_ply, 2},
+    {"_ply_cpp_xp_apply_ply", (DL_FUNC) &_ply_cpp_xp_apply_ply, 2},
+    {"_ply_cpp_xp_generate_legal_moves", (DL_FUNC) &_ply_cpp_xp_generate_legal_moves, 1},
+    {"_ply_cpp_xp_count_legal_moves", (DL_FUNC) &_ply_cpp_xp_count_legal_moves, 1},
+    {"_ply_cpp_xp_is_insufficient_material", (DL_FUNC) &_ply_cpp_xp_is_insufficient_material, 1},
+    {"_ply_cpp_xp_validate_position", (DL_FUNC) &_ply_cpp_xp_validate_position, 1},
+    {"_ply_cpp_xp_position_hash", (DL_FUNC) &_ply_cpp_xp_position_hash, 1},
+    {"_ply_cpp_xp_perft", (DL_FUNC) &_ply_cpp_xp_perft, 2},
     {"_ply_cpp_init_game", (DL_FUNC) &_ply_cpp_init_game, 0},
     {"_ply_cpp_parse_fen", (DL_FUNC) &_ply_cpp_parse_fen, 1},
     {"_ply_cpp_state_to_fen", (DL_FUNC) &_ply_cpp_state_to_fen, 1},

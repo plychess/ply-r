@@ -683,7 +683,6 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
     uint8_t piece_type = piece_index - offset;
 
     // Check dest for capture via mailbox (O(1))
-    uint64_t to_mask = 1ULL << to;
     uint8_t captured_index = next.mailbox[to];
     bool dst_has_piece = (captured_index != NO_PIECE);
     bool is_capture = dst_has_piece;
@@ -1119,7 +1118,6 @@ static MoveGenInfo compute_movegen_info(const GameState& state) {
 
     uint8_t side = state.sideToMove;
     uint8_t opp = side ^ 1;
-    uint8_t offset = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
     uint8_t opp_off = (opp == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
 
     info.king_sq = find_king_square(state, side);
