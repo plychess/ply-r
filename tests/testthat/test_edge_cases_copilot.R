@@ -17,7 +17,7 @@ test_that("replay_all_games handles empty PGN file gracefully", {
   on.exit(unlink(tmp))
 
   result <- replay_all_games(tmp)
-  expect_true(is.data.frame(result) || nrow(result) == 0 || is.null(result))
+  expect_true(is.null(result) || (is.data.frame(result) && nrow(result) == 0L))
 })
 
 test_that("cpp_replay_pgn_file handles empty file gracefully", {
