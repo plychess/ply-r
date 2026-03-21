@@ -134,7 +134,7 @@ BEGIN_RCPP
 END_RCPP
 }
 // cpp_xp_perft
-int cpp_xp_perft(std::string fen, int depth);
+double cpp_xp_perft(std::string fen, int depth);
 RcppExport SEXP _ply_cpp_xp_perft(SEXP fenSEXP, SEXP depthSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;

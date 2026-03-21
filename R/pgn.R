@@ -109,6 +109,12 @@ replay_all_games <- function(pgn_path) {
   lengths    <- lengths[keep]
   ids        <- which(keep)
 
+  if (length(ids) == 0L) {
+    return(data.frame(game_id = integer(0), fen = character(0),
+                      uci_move = character(0), ply_num = integer(0),
+                      ok = logical(0), stringsAsFactors = FALSE))
+  }
+
   all_moves   <- unlist(move_lists, use.names = FALSE)
   game_starts <- cumsum(c(1L, lengths[-length(lengths)]))
 
