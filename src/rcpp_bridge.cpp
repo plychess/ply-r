@@ -7,7 +7,6 @@
 #include "chess_engine.h"
 #include "chess_game.h"
 #include <fstream>
-#include <thread>
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -1186,48 +1185,39 @@ DataFrame cpp_replay_pgn_file(std::string path) {
     std::vector<int>         out_game_ids(n);
     std::vector<char>        out_ok(n, 0);
 
-    // Multi-threaded replay
-    int hw = std::thread::hardware_concurrency();
-    int n_threads = std::max(1, std::min(hw, n_games));
+    // Single-threaded replay (R is not thread-safe)
+    for (int g = 0; g < n_games; g++) {
+        int start = game_starts[g];
+        int end = (g + 1 < n_games) ? game_starts[g + 1] : n;
+        int gid = game_ids[g];
 
-    auto worker = [&](int tid) {
-        for (int g = tid; g < n_games; g += n_threads) {
-            int start = game_starts[g];
-            int end = (g + 1 < n_games) ? game_starts[g + 1] : n;
-            int gid = game_ids[g];
+        chess::GameState state;
+        chess::init_game(state);
 
-            chess::GameState state;
-            chess::init_game(state);
+        bool game_ok = true;
+        for (int i = start; i < end; i++) {
+            out_game_ids[i] = gid;
+            out_fens[i] = chess::state_to_fen(state);
+            out_ply_nums[i] = (i - start) + 1;
 
-            bool game_ok = true;
-            for (int i = start; i < end; i++) {
-                out_game_ids[i] = gid;
-                out_fens[i] = chess::state_to_fen(state);
-                out_ply_nums[i] = (i - start) + 1;
-
-                if (!game_ok) {
-                    out_ucis[i] = "";
-                    out_ok[i] = 0;
-                    continue;
-                }
-
-                uint32_t ply = resolve_san(state, all_moves[i]);
-                if (ply == 0) {
-                    out_ucis[i] = "";
-                    out_ok[i] = 0;
-                    game_ok = false;
-                    continue;
-                }
-                out_ucis[i] = chess::ply_to_uci(ply);
-                out_ok[i] = 1;
-                state = chess::apply_ply_memory(state, ply);
+            if (!game_ok) {
+                out_ucis[i] = "";
+                out_ok[i] = 0;
+                continue;
             }
-        }
-    };
 
-    std::vector<std::thread> threads;
-    for (int t = 0; t < n_threads; t++) threads.emplace_back(worker, t);
-    for (auto& t : threads) t.join();
+            uint32_t ply = resolve_san(state, all_moves[i]);
+            if (ply == 0) {
+                out_ucis[i] = "";
+                out_ok[i] = 0;
+                game_ok = false;
+                continue;
+            }
+            out_ucis[i] = chess::ply_to_uci(ply);
+            out_ok[i] = 1;
+            state = chess::apply_ply_memory(state, ply);
+        }
+    }
 
     // Copy to R vectors
     StringVector r_fens(n), r_ucis(n);
