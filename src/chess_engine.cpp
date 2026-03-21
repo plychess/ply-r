@@ -714,6 +714,7 @@ GameState apply_ply_to_memory(const GameState& state, uint32_t ply) {
                 h ^= ZOBRIST_PIECE[opp_offset + captured_type][to];
             }
             add_piece(next, color, promoted, to);
+            next.mailbox[from] = NO_PIECE;  // clear pawn's old square
             h ^= ZOBRIST_PIECE[offset + PIECE_PAWN][from];
             h ^= ZOBRIST_PIECE[offset + promoted][to];
         } else {

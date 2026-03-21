@@ -66,9 +66,6 @@ static List state_to_list(const chess::GameState& s) {
 // External pointer API (zero-copy GameState passing)
 // ============================================================
 
-// Destructor called when R garbage-collects the external pointer
-static void gamestate_finalizer(chess::GameState* p) { delete p; }
-
 // Wrap a GameState in an R external pointer
 static SEXP wrap_state(chess::GameState* s) {
     Rcpp::XPtr<chess::GameState> ptr(s, true); // true = register destructor
@@ -177,8 +174,9 @@ bool cpp_xp_validate_position(SEXP state) {
 std::string cpp_xp_position_hash(SEXP state) {
     chess::GameState tmp;
     const chess::GameState& s = any_to_state_ref(state, tmp);
+    uint64_t h = chess::position_hash(s);  // same FNV-1a as cpp_position_hash
     char buf[20];
-    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)s.hash);
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
     return std::string(buf);
 }
 
