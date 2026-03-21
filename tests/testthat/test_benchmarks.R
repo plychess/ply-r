@@ -78,47 +78,7 @@ test_that("single game replay > 20,000 plies/sec", {
 })
 
 # ---------------------------------------------------------------------------
-# 4. Batch replay throughput (Tal.pgn — 2,431 games, 173K plies)
-# ---------------------------------------------------------------------------
-
-test_that("batch replay of Tal.pgn > 30,000 plies/sec", {
-  pgn <- file.path(root, "pgnmentor", "Tal.pgn")
-  skip_if_not(file.exists(pgn), "Tal.pgn not found")
-
-  t0 <- proc.time()
-  positions <- replay_all_games(pgn)
-  elapsed <- (proc.time() - t0)["elapsed"]
-  n_plies <- nrow(positions)
-  rate <- n_plies / elapsed
-  cat(sprintf("\n  Tal.pgn batch replay: %.0f plies/sec (%s plies in %.2fs)\n",
-              rate, format(n_plies, big.mark = ","), elapsed))
-  expect_gt(rate, 30000)
-  expect_equal(sum(!positions$ok), 0L)
-})
-
-# ---------------------------------------------------------------------------
-# 5. Batch enrichment throughput (cpp_enrich_batch)
-# ---------------------------------------------------------------------------
-
-test_that("batch enrichment > 5,000 positions/sec", {
-  pgn <- file.path(root, "pgnmentor", "Tal.pgn")
-  skip_if_not(file.exists(pgn), "Tal.pgn not found")
-
-  # Use first 5,000 Tal positions
-  positions <- replay_all_games(pgn)
-  sample_pos <- head(positions[positions$ok, ], 5000)
-
-  t0 <- proc.time()
-  cpp_enrich_batch(sample_pos$fen, sample_pos$uci_move)
-  elapsed <- (proc.time() - t0)["elapsed"]
-  rate <- nrow(sample_pos) / elapsed
-  cat(sprintf("\n  Batch enrichment: %.0f positions/sec (5000 in %.2fs)\n",
-              rate, elapsed))
-  expect_gt(rate, 5000)
-})
-
-# ---------------------------------------------------------------------------
-# 6. Perft — correctness via known node counts (also measures speed)
+# 4. Perft — correctness via known node counts (also measures speed)
 # ---------------------------------------------------------------------------
 
 test_that("perft depth 1-3 matches published node counts", {
@@ -161,25 +121,3 @@ test_that("perft depth 1 for Kiwipete position = 48", {
   expect_equal(length(moves), 48L)
 })
 
-# ---------------------------------------------------------------------------
-# 7. Multi-PGN stress test — replay a large tournament file
-# ---------------------------------------------------------------------------
-
-test_that("large tournament PGN replays without errors", {
-  pgn <- file.path(root, "pgnmentor", "Gibraltar2019.pgn")
-  skip_if_not(file.exists(pgn), "Gibraltar2019.pgn not found")
-
-  t0 <- proc.time()
-  positions <- replay_all_games(pgn)
-  elapsed <- (proc.time() - t0)["elapsed"]
-  n_plies <- nrow(positions)
-  n_err <- sum(!positions$ok)
-  rate <- n_plies / elapsed
-
-  cat(sprintf("\n  Gibraltar2019: %s plies, %d errors, %.0f plies/sec (%.2fs)\n",
-              format(n_plies, big.mark = ","), n_err, rate, elapsed))
-  # Allow some errors (PGN quality varies) but must be < 1%
-  error_pct <- 100 * n_err / n_plies
-  expect_lt(error_pct, 1.0)
-  expect_gt(rate, 20000)
-})

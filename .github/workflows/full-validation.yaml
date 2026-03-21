@@ -25,7 +25,14 @@ jobs:
       - name: Install package
         run: R CMD INSTALL .
 
-      - name: Run full validation tests (benchmarks + perft depth 5/6)
+      - name: Run comprehensive perft tests (all 6 positions, depth 1-7)
+        env:
+          CI: "false"
+          NOT_CRAN: "true"
+        run: |
+          Rscript -e 'library(testthat); library(ply); testthat::test_file("tests/testthat/test_perft_comprehensive.R")'
+
+      - name: Run benchmarks + legacy perft tests
         env:
           CI: "false"
           NOT_CRAN: "true"
@@ -33,3 +40,9 @@ jobs:
           Rscript -e 'library(testthat); library(ply); testthat::test_file("tests/testthat/test_benchmarks.R")'
           Rscript -e 'library(testthat); library(ply); testthat::test_file("tests/testthat/test_perft_depth5.R")'
           Rscript -e 'library(testthat); library(ply); testthat::test_file("tests/testthat/test_perft_depth6.R")'
+
+      - name: Run Copilot edge case tests
+        env:
+          NOT_CRAN: "true"
+        run: |
+          Rscript -e 'library(testthat); library(ply); testthat::test_file("tests/testthat/test_edge_cases_copilot.R")'

@@ -10,6 +10,7 @@
 #include <thread>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 
 using namespace Rcpp;
 
@@ -82,11 +83,22 @@ static chess::GameState& unwrap_state(SEXP xp) {
 }
 
 // Accepts either a List (old API) or external pointer (new API)
+// Returns by value (copy) — use for functions that need a mutable copy
 static chess::GameState any_to_state(SEXP x) {
     if (TYPEOF(x) == EXTPTRSXP) {
         return unwrap_state(x);
     }
     return list_to_state(as<List>(x));
+}
+
+// Returns const reference for XPtr, or materializes a temporary for List
+// Use for read-only functions (in_check, state_to_fen, etc.)
+static const chess::GameState& any_to_state_ref(SEXP x, chess::GameState& tmp) {
+    if (TYPEOF(x) == EXTPTRSXP) {
+        return unwrap_state(x);
+    }
+    tmp = list_to_state(as<List>(x));
+    return tmp;
 }
 
 // [[Rcpp::export]]
@@ -104,17 +116,20 @@ SEXP cpp_xp_parse_fen(std::string fen) {
 
 // [[Rcpp::export]]
 std::string cpp_xp_state_to_fen(SEXP state) {
-    return chess::state_to_fen(any_to_state(state));
+    chess::GameState tmp;
+    return chess::state_to_fen(any_to_state_ref(state, tmp));
 }
 
 // [[Rcpp::export]]
 bool cpp_xp_in_check(SEXP state, int color) {
-    return chess::in_check(any_to_state(state), static_cast<uint8_t>(color));
+    chess::GameState tmp;
+    return chess::in_check(any_to_state_ref(state, tmp), static_cast<uint8_t>(color));
 }
 
 // [[Rcpp::export]]
 bool cpp_xp_is_legal_ply(SEXP state, int ply) {
-    return chess::is_legal_ply(any_to_state(state), static_cast<uint32_t>(ply));
+    chess::GameState tmp;
+    return chess::is_legal_ply(any_to_state_ref(state, tmp), static_cast<uint32_t>(ply));
 }
 
 // [[Rcpp::export]]
@@ -126,7 +141,8 @@ SEXP cpp_xp_apply_ply(SEXP state, int ply) {
 
 // [[Rcpp::export]]
 IntegerVector cpp_xp_generate_legal_moves(SEXP state) {
-    chess::GameState s = any_to_state(state);
+    chess::GameState tmp;
+    const chess::GameState& s = any_to_state_ref(state, tmp);
     std::vector<uint32_t> moves = chess::generate_legal_moves(s);
     IntegerVector result(moves.size());
     for (size_t i = 0; i < moves.size(); i++) result[i] = static_cast<int>(moves[i]);
@@ -135,32 +151,37 @@ IntegerVector cpp_xp_generate_legal_moves(SEXP state) {
 
 // [[Rcpp::export]]
 int cpp_xp_count_legal_moves(SEXP state) {
-    return chess::count_legal_moves(any_to_state(state));
+    chess::GameState tmp;
+    return chess::count_legal_moves(any_to_state_ref(state, tmp));
 }
 
 // [[Rcpp::export]]
 bool cpp_xp_is_insufficient_material(SEXP state) {
-    return chess::is_insufficient_material(any_to_state(state));
+    chess::GameState tmp;
+    return chess::is_insufficient_material(any_to_state_ref(state, tmp));
 }
 
 // [[Rcpp::export]]
 bool cpp_xp_validate_position(SEXP state) {
-    return chess::validate_position(any_to_state(state));
+    chess::GameState tmp;
+    return chess::validate_position(any_to_state_ref(state, tmp));
 }
 
 // [[Rcpp::export]]
 std::string cpp_xp_position_hash(SEXP state) {
-    chess::GameState s = any_to_state(state);
+    chess::GameState tmp;
+    const chess::GameState& s = any_to_state_ref(state, tmp);
     char buf[20];
     std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)s.hash);
     return std::string(buf);
 }
 
 // [[Rcpp::export]]
-int cpp_xp_perft(std::string fen, int depth) {
+double cpp_xp_perft(std::string fen, int depth) {
     chess::init_attack_tables();
     chess::GameState state = chess::parse_fen(fen);
     // Simple perft for R use — single-threaded, no TT
+    // Returns double to avoid int overflow at depth 7+ (3.2B nodes)
     std::function<uint64_t(const chess::GameState&, int)> perft =
         [&](const chess::GameState& s, int d) -> uint64_t {
         if (d == 0) return 1ULL;
@@ -174,7 +195,7 @@ int cpp_xp_perft(std::string fen, int depth) {
         }
         return total;
     };
-    return static_cast<int>(perft(state, depth));
+    return static_cast<double>(perft(state, depth));
 }
 
 // ============================================================
@@ -1097,13 +1118,22 @@ static std::vector<std::string> extract_san_moves(const char* begin, const char*
 DataFrame cpp_replay_pgn_file(std::string path) {
     chess::init_attack_tables();
 
-    // Read entire file
+    // Read entire file with safety checks
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) stop("Cannot open file: " + path);
-    size_t file_size = file.tellg();
+    std::ifstream::pos_type end_pos = file.tellg();
+    if (end_pos == std::ifstream::pos_type(-1)) {
+        file.close();
+        stop("Failed to determine file size: " + path);
+    }
+    size_t file_size = static_cast<size_t>(end_pos);
     file.seekg(0);
-    std::string content(file_size, '\0');
-    file.read(&content[0], file_size);
+    std::string content;
+    if (file_size > 0) {
+        content.resize(file_size);
+        file.read(&content[0], file_size);
+        if (!file) { file.close(); stop("Failed to read file: " + path); }
+    }
     file.close();
 
     // Split into games on "\n[Event " boundaries
@@ -1116,7 +1146,8 @@ DataFrame cpp_replay_pgn_file(std::string path) {
     // Find first [Event
     while (game_start < data_end && std::strncmp(game_start, "[Event ", 7) != 0) game_start++;
 
-    const char* scan = game_start + 1;
+    // No games found — return early
+    const char* scan = (game_start < data_end) ? game_start + 1 : data_end;
     while (scan < data_end) {
         // Look for \n[Event
         if (*scan == '\n' && scan + 7 < data_end && std::strncmp(scan + 1, "[Event ", 7) == 0) {
