@@ -227,8 +227,8 @@ static void init_magic_for_square(int sq, bool is_rook) {
     // Get table pointer
     uint64_t* table = is_rook ? &ROOK_TABLE[sq * 4096] : &BISHOP_TABLE[sq * 512];
 
-    // Find magic number
-    while (true) {
+    // Find magic number (capped iterations to guarantee termination)
+    for (int attempt = 0; attempt < 100000000; attempt++) {
         uint64_t magic = sparse_rand64();
 
         // Quick rejection: check if high bits have enough set bits
@@ -257,6 +257,8 @@ static void init_magic_for_square(int sq, bool is_rook) {
             return;
         }
     }
+    // Fallback: should never happen with deterministic seed
+    throw std::runtime_error("Failed to find magic number for square");
 }
 
 static bool magic_tables_initialized = false;

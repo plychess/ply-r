@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <functional>
 
 using namespace Rcpp;
 
@@ -77,7 +78,13 @@ static SEXP wrap_state(chess::GameState* s) {
 
 // Unwrap: get C++ pointer from R external pointer
 static chess::GameState& unwrap_state(SEXP xp) {
+    if (TYPEOF(xp) != EXTPTRSXP || !Rf_inherits(xp, "ChessStateXPtr")) {
+        Rcpp::stop("Expected an external pointer of class 'ChessStateXPtr'");
+    }
     Rcpp::XPtr<chess::GameState> ptr(xp);
+    if (ptr.get() == nullptr) {
+        Rcpp::stop("Null external pointer for ChessStateXPtr");
+    }
     return *ptr;
 }
 
@@ -1143,7 +1150,8 @@ DataFrame cpp_replay_pgn_file(std::string path) {
     const char* game_start = data;
 
     // Find first [Event
-    while (game_start < data_end && std::strncmp(game_start, "[Event ", 7) != 0) game_start++;
+    while (game_start + 7 <= data_end && std::strncmp(game_start, "[Event ", 7) != 0) game_start++;
+    if (game_start + 7 > data_end) game_start = data_end;
 
     // No games found — return early
     const char* scan = (game_start < data_end) ? game_start + 1 : data_end;
