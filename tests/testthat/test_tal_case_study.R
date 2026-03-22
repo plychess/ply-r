@@ -403,20 +403,24 @@ MOVE_TYPE_FORMULA_MIDTERM <- move_type ~ num_pieces + material_bal + legal_move_
   en_passant_avail + repetition_count +
   gives_discovered_check
 
-# Enhanced formula with static eval features (37 predictors)
-MOVE_TYPE_FORMULA <- move_type ~ num_pieces + material_bal + legal_move_count +
-  ply + num_captures_avail + num_checks_avail +
-  max_capture_value + num_sacrifices_avail +
-  num_winning_caps_avail + max_sacrifice_gap + in_material_deficit +
+# Pruned formula — 28 predictors after correlation analysis (step 3)
+# Dropped 10 redundant features:
+#   num_pieces, ply (corr with pieces_defended)
+#   position_eval, best_move_eval, best_quiet_eval (corr with material_bal)
+#   best_capture_eval, worst_capture_eval (corr with best_sacrifice_eval, max_capture_value)
+#   num_sacrifices_avail, max_sacrifice_gap (corr with num_captures_avail)
+#   capture_eval_spread (corr with max_capture_value)
+MOVE_TYPE_FORMULA <- move_type ~ material_bal + legal_move_count +
+  num_captures_avail + num_checks_avail +
+  max_capture_value + num_winning_caps_avail + in_material_deficit +
   king_safety_own + king_safety_opp +
   passed_pawns + isolated_pawns + pin_count +
   mob_knight + mob_queen +
   best_capture_net + num_safe_sacrifices + opp_recapture_after_move +
   undeveloped_minors + center_occupied + center_attacked +
   space_advantage + pieces_defended + pawn_chain_length + pawn_islands +
-  position_eval + chosen_move_eval + best_move_eval + eval_gap +
-  best_quiet_eval + best_capture_eval + worst_capture_eval +
-  capture_eval_spread + best_sacrifice_eval + num_moves_better_than_chosen
+  chosen_move_eval + eval_gap +
+  best_sacrifice_eval + num_moves_better_than_chosen
 
 test_that("move type labeling produces all 6 classes", {
   skip_if_not(file.exists(tal_pgn), "Tal.pgn not found")
@@ -598,21 +602,19 @@ test_that("full model comparison: midterm vs evaluative features vs reweighting"
 
   # === Model 6: XGBoost (gradient-boosted trees) ===
   # Prepare numeric matrix — XGBoost needs all-numeric input
-  # All features including static eval
+  # Pruned after correlation analysis — 28 features
   pred_vars <- c(
-    "num_pieces", "material_bal", "legal_move_count", "ply",
+    "material_bal", "legal_move_count",
     "num_captures_avail", "num_checks_avail",
-    "max_capture_value", "num_sacrifices_avail", "num_winning_caps_avail",
-    "max_sacrifice_gap", "in_material_deficit",
+    "max_capture_value", "num_winning_caps_avail", "in_material_deficit",
     "king_safety_own", "king_safety_opp",
     "passed_pawns", "isolated_pawns", "pin_count",
     "mob_knight", "mob_queen",
     "best_capture_net", "num_safe_sacrifices", "opp_recapture_after_move",
     "undeveloped_minors", "center_occupied", "center_attacked",
     "space_advantage", "pieces_defended", "pawn_chain_length", "pawn_islands",
-    "position_eval", "chosen_move_eval", "best_move_eval", "eval_gap",
-    "best_quiet_eval", "best_capture_eval", "worst_capture_eval",
-    "capture_eval_spread", "best_sacrifice_eval", "num_moves_better_than_chosen"
+    "chosen_move_eval", "eval_gap",
+    "best_sacrifice_eval", "num_moves_better_than_chosen"
   )
   xgb_vars <- pred_vars
 
