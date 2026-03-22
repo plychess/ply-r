@@ -25,3 +25,17 @@ check/
 .vscode/*.log
 
 .claude/
+
+# Compiled bench binaries
+engine_match
+ply-engine
+search_bench
+search_test
+self_play
+perft_bench
+perft_depth6
+perft_depth7
+perft_depth8
+perft_depth9
+perft_depth10
+perft_verify
