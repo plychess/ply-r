@@ -2005,20 +2005,86 @@ static const int PIECE_VALUES_CP[6] = { 100, 320, 330, 500, 900, 20000 };
 int evaluate(const GameState& state) {
     int score = 0;
 
+    // Material + piece-square tables
     for (int p = 0; p < 6; p++) {
-        // White pieces
         uint64_t bb = state.bitboards[WHITE_OFFSET + p];
         while (bb) {
             uint8_t sq = pop_lsb(bb);
             score += PIECE_VALUES_CP[p] + PST_ALL[p][sq];
         }
-        // Black pieces — mirror the PST (flip rank)
         bb = state.bitboards[BLACK_OFFSET + p];
         while (bb) {
             uint8_t sq = pop_lsb(bb);
-            uint8_t mirrored = (7 - (sq >> 3)) * 8 + (sq & 7); // flip rank
+            uint8_t mirrored = (7 - (sq >> 3)) * 8 + (sq & 7);
             score -= PIECE_VALUES_CP[p] + PST_ALL[p][mirrored];
         }
+    }
+
+    // Check bonus: if the side to move is in check, the OTHER side gains a tempo
+    // (+30 centipawns for having the opponent in check)
+    if (in_check(state, state.sideToMove)) {
+        score += (state.sideToMove == COLOR_WHITE) ? -30 : 30;
+    }
+
+    // Mobility: count legal moves for both sides (approximate via attack counts)
+    // Full legal move generation is too expensive here, so use a lighter proxy:
+    // count attacked squares for each side's non-pawn, non-king pieces
+    uint64_t occ = state.bitboards[WHITE_OFFSET + PIECE_PAWN] |
+                   state.bitboards[WHITE_OFFSET + PIECE_KNIGHT] |
+                   state.bitboards[WHITE_OFFSET + PIECE_BISHOP] |
+                   state.bitboards[WHITE_OFFSET + PIECE_ROOK] |
+                   state.bitboards[WHITE_OFFSET + PIECE_QUEEN] |
+                   state.bitboards[WHITE_OFFSET + PIECE_KING] |
+                   state.bitboards[BLACK_OFFSET + PIECE_PAWN] |
+                   state.bitboards[BLACK_OFFSET + PIECE_KNIGHT] |
+                   state.bitboards[BLACK_OFFSET + PIECE_BISHOP] |
+                   state.bitboards[BLACK_OFFSET + PIECE_ROOK] |
+                   state.bitboards[BLACK_OFFSET + PIECE_QUEEN] |
+                   state.bitboards[BLACK_OFFSET + PIECE_KING];
+
+    for (int color = 0; color < 2; color++) {
+        int off = (color == 0) ? WHITE_OFFSET : BLACK_OFFSET;
+        int sign = (color == 0) ? 1 : -1;
+        int mobility = 0;
+
+        // Knight mobility
+        uint64_t bb = state.bitboards[off + PIECE_KNIGHT];
+        while (bb) { uint8_t sq = pop_lsb(bb); mobility += __builtin_popcountll(knight_attacks(sq)); }
+
+        // Bishop mobility
+        bb = state.bitboards[off + PIECE_BISHOP];
+        while (bb) { uint8_t sq = pop_lsb(bb); mobility += __builtin_popcountll(bishop_attacks(sq, occ)); }
+
+        // Rook mobility
+        bb = state.bitboards[off + PIECE_ROOK];
+        while (bb) { uint8_t sq = pop_lsb(bb); mobility += __builtin_popcountll(rook_attacks(sq, occ)); }
+
+        // Queen mobility
+        bb = state.bitboards[off + PIECE_QUEEN];
+        while (bb) {
+            uint8_t sq = pop_lsb(bb);
+            mobility += __builtin_popcountll(bishop_attacks(sq, occ) | rook_attacks(sq, occ));
+        }
+
+        score += sign * mobility * 3; // 3cp per attacked square
+    }
+
+    // King safety: penalize open files near own king
+    for (int color = 0; color < 2; color++) {
+        int off = (color == 0) ? WHITE_OFFSET : BLACK_OFFSET;
+        int sign = (color == 0) ? 1 : -1;
+        uint8_t king_sq = find_king_square(state, color);
+        int king_file = king_sq & 7;
+
+        // Pawn shield: count friendly pawns in king's vicinity (king file ± 1, 1-2 ranks ahead)
+        uint64_t own_pawns = state.bitboards[off + PIECE_PAWN];
+        int shield = 0;
+        for (int f = king_file - 1; f <= king_file + 1; f++) {
+            if (f < 0 || f > 7) continue;
+            uint64_t file_mask = 0x0101010101010101ULL << f;
+            if (own_pawns & file_mask) shield++;
+        }
+        score += sign * shield * 15; // 15cp per shielding pawn
     }
 
     return score;

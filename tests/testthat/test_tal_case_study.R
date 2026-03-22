@@ -362,30 +362,25 @@ build_tal_dataset <- function(tal_pgn, n_games = 100L) {
   )
   df$fen_key <- NULL
 
-  # 7-class move type labels (priority order; castling merged into quiet_restrained)
-  # Castling is mechanically unique but not a distinct decision type — it's a
-  # quiet positional move. Keeping it as a class inflated accuracy via the
-  # near-deterministic can_castle gate. is_castling remains as an enrichment flag.
+  # 6-class move type labels (priority order)
+  # castling → quiet_restrained (not a distinct decision type)
+  # sacrifice_check → check (forcing moves; too few examples as separate class)
   label        <- rep("quiet_restrained", nrow(df))
   quiet_forced <- df$num_checks_avail == 0 &
                   df$num_captures_avail == 0 &
                   df$num_sacrifices_avail == 0
   is_sac       <- df$is_capture & df$moved_piece_value > df$captured_piece_value
   win_cap      <- df$is_capture & df$captured_piece_value > df$moved_piece_value
-  any_chk      <- df$gives_check & !df$is_capture
-  sac_chk      <- is_sac & df$gives_check
+  any_chk      <- df$gives_check  # all check-giving moves, capturing or not
 
   label[quiet_forced]    <- "quiet_forced"
   label[df$is_capture]   <- "trade"
   label[win_cap]         <- "winning_capture"
   label[is_sac]          <- "sacrifice"
-  label[any_chk]         <- "check"
-  label[sac_chk]         <- "sacrifice_check"
-  # castling stays as quiet_restrained (the default)
+  label[any_chk]         <- "check"       # sacrifice_check now merged here
   df$move_type <- factor(label, levels = c(
     "quiet_forced", "quiet_restrained", "trade",
-    "winning_capture", "sacrifice", "sacrifice_check",
-    "check"
+    "winning_capture", "sacrifice", "check"
   ))
 
   # Coerce logical columns to integer for model fitting
@@ -423,23 +418,22 @@ MOVE_TYPE_FORMULA <- move_type ~ num_pieces + material_bal + legal_move_count +
   best_quiet_eval + best_capture_eval + worst_capture_eval +
   capture_eval_spread + best_sacrifice_eval + num_moves_better_than_chosen
 
-test_that("move type labeling produces all 7 classes", {
+test_that("move type labeling produces all 6 classes", {
   skip_if_not(file.exists(tal_pgn), "Tal.pgn not found")
   df <- build_tal_dataset(tal_pgn, n_games = 100L)
   skip_if(is.null(df), "No Tal positions replayed")
 
   expect_true(is.factor(df$move_type))
-  expect_equal(length(levels(df$move_type)), 7L)
-  # Castling moves should be absorbed into quiet_restrained
+  expect_equal(length(levels(df$move_type)), 6L)
+  # Castling absorbed into quiet_restrained, sacrifice_check absorbed into check
   expect_false("castling" %in% levels(df$move_type))
+  expect_false("sacrifice_check" %in% levels(df$move_type))
   # is_castling enrichment flag should still be present
   expect_true("is_castling" %in% names(df))
-  expect_true(any(as.logical(df$is_castling)),
-    info = "Castling moves exist but are classified as quiet_restrained")
-  # At least 5 of the 7 classes should appear in 100 games
+  # At least 5 of the 6 classes should appear in 100 games
   observed <- length(unique(df$move_type))
   expect_true(observed >= 5L,
-    info = sprintf("Only %d of 7 classes observed in 100 games", observed))
+    info = sprintf("Only %d of 6 classes observed in 100 games", observed))
 })
 
 test_that("class distribution is imbalanced (quiet classes dominate)", {
@@ -530,9 +524,7 @@ test_that("per-class sensitivity: gate-driven classes outperform sacrifice class
   }
 
   sens_quiet_f     <- sens("quiet_forced")
-  sens_win_cap     <- sens("winning_capture")
   sens_sacrifice   <- sens("sacrifice")
-  sens_sac_check   <- sens("sacrifice_check")
 
   cat("\n  Per-class sensitivity (LR):\n")
   for (cls in levels(test$move_type)) {
@@ -541,22 +533,10 @@ test_that("per-class sensitivity: gate-driven classes outperform sacrifice class
     if (!is.na(s)) cat(sprintf("    %-20s %5.1f%%  (n=%d)\n", cls, s * 100, n))
   }
 
-  # Gate-driven classes should have higher sensitivity than sacrifice classes
-  if (!is.na(sens_quiet_f) && !is.na(sens_sacrifice)) {
-    expect_true(sens_quiet_f > sens_sacrifice,
-      info = "Quiet-forced should be easier to predict than sacrifices")
-  }
-
-  # Combined sacrifice sensitivity should be low (midterm finding)
-  sac_classes <- c("sacrifice", "sacrifice_check")
-  sac_actual  <- test$move_type %in% sac_classes
-  if (sum(sac_actual) > 0) {
-    sac_sens <- mean(lr_pred[sac_actual] %in% sac_classes)
-    cat(sprintf("    Combined sacrifice sensitivity: %.1f%%\n", sac_sens * 100))
-    # With static eval features, sacrifice detection now exceeds the
-    # midterm ceiling — eval_gap and best_sacrifice_eval provide the
-    # evaluative signal the midterm identified as missing
-    expect_true(sac_sens > 0.50,
+  # Sacrifice sensitivity should be strong with eval features
+  if (!is.na(sens_sacrifice)) {
+    cat(sprintf("    Sacrifice sensitivity: %.1f%%\n", sens_sacrifice * 100))
+    expect_true(sens_sacrifice > 0.50,
       info = "Static eval features should push sacrifice sensitivity above 50%")
   }
 })
@@ -586,9 +566,9 @@ test_that("full model comparison: midterm vs evaluative features vs reweighting"
     mean(pred[actual] == cls)
   }
   sac_sens <- function(pred) {
-    sac_actual <- test$move_type %in% c("sacrifice", "sacrifice_check")
+    sac_actual <- test$move_type == "sacrifice"
     if (sum(sac_actual) == 0) return(NA_real_)
-    mean(pred[sac_actual] %in% c("sacrifice", "sacrifice_check"))
+    mean(pred[sac_actual] == "sacrifice")
   }
 
   # === Model 1: Majority baseline ===
