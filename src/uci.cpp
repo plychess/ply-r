@@ -128,6 +128,15 @@ int main() {
     init_zobrist();
     init_game(position);
 
+    // Try to load NNUE weights (v2 first, then v1)
+    if (load_nnue("training/nnue_v2_weights.bin")) {
+        std::cerr << "NNUE v2 loaded (bitboard, style-conditioned)" << std::endl;
+    } else if (load_nnue("training/nnue_weights.bin")) {
+        std::cerr << "NNUE v1 loaded (scalar, style-conditioned)" << std::endl;
+    } else {
+        std::cerr << "NNUE not found, using classic eval" << std::endl;
+    }
+
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream iss(line);

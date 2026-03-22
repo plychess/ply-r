@@ -2093,8 +2093,364 @@ int evaluate_classic(const GameState& state) {
     return score;
 }
 
-// Active evaluation: dispatches to classic or NNUE (future)
+// ============================================================
+// NNUE — Style-conditioned neural network evaluation
+// ============================================================
+
+struct NNUEWeights {
+    bool loaded = false;
+    int version = 1;
+    int n_features = 24;
+    int n_players = 2;
+    int style_dim = 8;
+    int active_style = 0; // 0=Tal, 1=Karpov
+
+    // Layer weights (row-major, out × in)
+    std::vector<float> fc1_w, fc1_b;
+    std::vector<float> fc2_w, fc2_b;
+    std::vector<float> fc3_w, fc3_b;
+    std::vector<float> fc4_w, fc4_b;
+    std::vector<float> style_embed;
+    std::vector<float> means, sds;
+    float eval_mean = 0, eval_sd = 1;
+};
+
+static NNUEWeights nnue;
+
+static void read_floats(FILE* f, std::vector<float>& v, int count) {
+    v.resize(count);
+    fread(v.data(), sizeof(float), count, f);
+}
+
+bool load_nnue(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    int magic, nf, np, sd;
+    fread(&magic, 4, 1, f);
+    fread(&nf, 4, 1, f);
+    fread(&np, 4, 1, f);
+    fread(&sd, 4, 1, f);
+
+    // Support both v1 (0x4E4E5545) and v2 (0x4E4E5532)
+    if (magic != 0x4E4E5545 && magic != 0x4E4E5532) { fclose(f); return false; }
+
+    nnue.n_features = nf;
+    nnue.n_players = np;
+    nnue.style_dim = sd;
+    int input_dim = nf + sd;
+
+    // v2: 769 + 8 → 512 → 32 → 1
+    int h1 = (magic == 0x4E4E5532) ? 512 : 256;
+    int h2 = (magic == 0x4E4E5532) ? 32 : 64;
+    int h3 = (magic == 0x4E4E5532) ? 0 : 16; // v2 has no fc3/fc4 split
+
+    read_floats(f, nnue.fc1_w, h1 * input_dim);
+    read_floats(f, nnue.fc1_b, h1);
+    read_floats(f, nnue.fc2_w, h2 * h1);
+    read_floats(f, nnue.fc2_b, h2);
+    if (magic == 0x4E4E5532) {
+        // v2: fc3 is 1 × 32 (output layer)
+        read_floats(f, nnue.fc3_w, 1 * h2);
+        read_floats(f, nnue.fc3_b, 1);
+        nnue.fc4_w.clear(); nnue.fc4_b.clear();
+    } else {
+        read_floats(f, nnue.fc3_w, h3 * h2);
+        read_floats(f, nnue.fc3_b, h3);
+        read_floats(f, nnue.fc4_w, 1 * h3);
+        read_floats(f, nnue.fc4_b, 1);
+    }
+    read_floats(f, nnue.style_embed, np * sd);
+
+    if (magic == 0x4E4E5545) {
+        // v1 has normalization params
+        read_floats(f, nnue.means, nf);
+        read_floats(f, nnue.sds, nf);
+    }
+    fread(&nnue.eval_mean, sizeof(float), 1, f);
+    fread(&nnue.eval_sd, sizeof(float), 1, f);
+
+    fclose(f);
+    nnue.loaded = true;
+    nnue.version = (magic == 0x4E4E5532) ? 2 : 1;
+    return true;
+}
+
+void set_nnue_style(int player_id) {
+    if (player_id >= 0 && player_id < nnue.n_players)
+        nnue.active_style = player_id;
+}
+
+bool nnue_loaded() { return nnue.loaded; }
+
+// Extract the 24 scalar features from a GameState (matching training feature order)
+static void extract_features(const GameState& state, float* out) {
+    uint64_t own_occ = side_occupancy(state, state.sideToMove);
+    uint64_t opp_occ = side_occupancy(state, state.sideToMove ^ 1);
+    uint64_t all_occ = own_occ | opp_occ;
+    uint8_t off = (state.sideToMove == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (state.sideToMove == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
+
+    // material_bal
+    int w_mat = 0, b_mat = 0, n_pcs = 0;
+    static const int pv[] = {1, 3, 3, 5, 9, 0};
+    for (int j = 0; j < 6; j++) {
+        int wc = popcount(state.bitboards[WHITE_OFFSET + j]);
+        int bc = popcount(state.bitboards[BLACK_OFFSET + j]);
+        w_mat += wc * pv[j]; b_mat += bc * pv[j];
+        n_pcs += wc + bc;
+    }
+    out[0] = (float)(w_mat - b_mat); // material_bal
+
+    // legal_move_count
+    auto moves = generate_legal_moves(state);
+    out[1] = (float)moves.size();
+
+    // Capture/check/sacrifice counts
+    int nc = 0, nchk = 0, n_wc = 0, max_cv = 0, n_sac = 0, n_safe_sac = 0;
+    int best_cap_net = -99;
+    for (auto m : moves) {
+        uint8_t mf, mt, mp; decode_ply(m, mf, mt, mp);
+        uint64_t mt_mask = 1ULL << mt;
+        bool cap = (opp_occ & mt_mask) != 0;
+        if (cap) {
+            nc++;
+            int cv = 0, mv = 0;
+            for (int j = 0; j < 6; j++) {
+                if (state.bitboards[opp_off + j] & mt_mask) { cv = pv[j]; break; }
+            }
+            for (int j = 0; j < 6; j++) {
+                if (state.bitboards[off + j] & (1ULL << mf)) { mv = pv[j]; break; }
+            }
+            if (cv > max_cv) max_cv = cv;
+            int net = cv - mv;
+            if (net > best_cap_net) best_cap_net = net;
+            if (cv > mv) n_wc++;
+            if (mv > cv) {
+                n_sac++;
+                GameState ns = apply_ply_to_memory(state, m);
+                if (!is_square_attacked(ns, mt, ns.sideToMove)) n_safe_sac++;
+            }
+        }
+        GameState ns = apply_ply_to_memory(state, m);
+        if (in_check(ns, ns.sideToMove)) nchk++;
+    }
+
+    out[2] = (float)nc;           // num_captures_avail
+    out[3] = (float)nchk;         // num_checks_avail
+    out[4] = (float)max_cv;       // max_capture_value
+    out[5] = (float)n_wc;         // num_winning_caps_avail
+    out[6] = (float)(out[0] < 0 ? 1 : 0); // in_material_deficit
+
+    // King safety
+    uint8_t own_ksq = find_king_square(state, state.sideToMove);
+    uint64_t zone = king_attacks(own_ksq) | (1ULL << own_ksq);
+    int ks_own = 0; uint64_t z = zone;
+    while (z) { uint8_t sq = pop_lsb(z); if (is_square_attacked(state, sq, state.sideToMove ^ 1)) ks_own++; }
+    out[7] = (float)ks_own;
+
+    uint8_t opp_ksq = find_king_square(state, state.sideToMove ^ 1);
+    zone = king_attacks(opp_ksq) | (1ULL << opp_ksq);
+    int ks_opp = 0; z = zone;
+    while (z) { uint8_t sq = pop_lsb(z); if (is_square_attacked(state, sq, state.sideToMove)) ks_opp++; }
+    out[8] = (float)ks_opp;
+
+    // Pawn structure
+    uint64_t own_pawns = state.bitboards[off + PIECE_PAWN];
+    static const uint64_t FILE_BB[8] = {
+        0x0101010101010101ULL, 0x0202020202020202ULL, 0x0404040404040404ULL, 0x0808080808080808ULL,
+        0x1010101010101010ULL, 0x2020202020202020ULL, 0x4040404040404040ULL, 0x8080808080808080ULL
+    };
+    int iso = 0;
+    for (int ff = 0; ff < 8; ff++) {
+        if (own_pawns & FILE_BB[ff]) {
+            uint64_t adj = 0;
+            if (ff > 0) adj |= FILE_BB[ff-1];
+            if (ff < 7) adj |= FILE_BB[ff+1];
+            if (!(own_pawns & adj)) iso += popcount(own_pawns & FILE_BB[ff]);
+        }
+    }
+    // Passed pawns (simplified)
+    uint64_t opp_pawns = state.bitboards[opp_off + PIECE_PAWN];
+    int passed = 0;
+    uint64_t pp = own_pawns;
+    while (pp) {
+        uint8_t sq = pop_lsb(pp);
+        uint8_t f2 = sq_file(sq), r2 = sq_rank(sq);
+        uint64_t adj_files = FILE_BB[f2];
+        if (f2 > 0) adj_files |= FILE_BB[f2-1];
+        if (f2 < 7) adj_files |= FILE_BB[f2+1];
+        uint64_t front = 0;
+        if (state.sideToMove == COLOR_WHITE) {
+            for (int r3 = r2+1; r3 < 8; r3++) front |= (0xFFULL << (r3*8)) & adj_files;
+        } else {
+            for (int r3 = 0; r3 < (int)r2; r3++) front |= (0xFFULL << (r3*8)) & adj_files;
+        }
+        if (!(opp_pawns & front)) passed++;
+    }
+    out[9] = (float)passed;  // passed_pawns
+    out[10] = (float)iso;    // isolated_pawns
+
+    // Pin count
+    uint64_t non_king = own_occ & ~(1ULL << own_ksq);
+    int pins = 0;
+    uint64_t pk = non_king;
+    while (pk) {
+        uint8_t sq = pop_lsb(pk);
+        uint64_t test_occ = all_occ & ~(1ULL << sq);
+        if (is_square_attacked_with_occ(state, own_ksq, state.sideToMove ^ 1, test_occ)) pins++;
+    }
+    out[11] = (float)pins;
+
+    // Mobility
+    int mob_n = 0, mob_q = 0;
+    for (auto m : moves) {
+        uint8_t mf, mt, mp; decode_ply(m, mf, mt, mp);
+        for (int j = 0; j < 6; j++) {
+            if (state.bitboards[off + j] & (1ULL << mf)) {
+                if (j == PIECE_KNIGHT) mob_n++;
+                if (j == PIECE_QUEEN) mob_q++;
+                break;
+            }
+        }
+    }
+    out[12] = (float)mob_n;
+    out[13] = (float)mob_q;
+
+    out[14] = (best_cap_net > -99) ? (float)best_cap_net : 0.0f;
+    out[15] = (float)n_safe_sac;
+    out[16] = 0.0f; // opp_recapture_after_move (not available without specific move)
+
+    // Positional
+    static const uint64_t CENTER_BB = (1ULL << 27) | (1ULL << 28) | (1ULL << 35) | (1ULL << 36);
+    out[17] = 0.0f; // undeveloped_minors (skip for speed)
+    out[18] = (float)popcount(own_occ & CENTER_BB);
+    static const uint8_t CENTER[4] = {27, 28, 35, 36};
+    int catk = 0;
+    for (int c = 0; c < 4; c++) if (is_square_attacked(state, CENTER[c], state.sideToMove)) catk++;
+    out[19] = (float)catk;
+
+    // Space
+    uint64_t enemy_half = (state.sideToMove == COLOR_WHITE) ? 0xFFFFFFFF00000000ULL : 0x00000000FFFFFFFFULL;
+    int space = 0;
+    uint64_t sq_mask = enemy_half;
+    while (sq_mask) {
+        uint8_t sq = pop_lsb(sq_mask);
+        if (is_square_attacked(state, sq, state.sideToMove)) space++;
+    }
+    out[20] = (float)space;
+
+    // Pieces defended
+    uint64_t own_no_king = own_occ & ~state.bitboards[off + PIECE_KING];
+    int defended = 0;
+    uint64_t pd = own_no_king;
+    while (pd) { uint8_t sq = pop_lsb(pd); if (is_square_attacked(state, sq, state.sideToMove)) defended++; }
+    out[21] = (float)defended;
+
+    // Pawn chain + islands (simplified)
+    out[22] = 0.0f; // pawn_chain_length
+    int islands = 0; bool prev = false;
+    for (int ff = 0; ff < 8; ff++) {
+        bool has = (own_pawns & FILE_BB[ff]) != 0;
+        if (has && !prev) islands++;
+        prev = has;
+    }
+    out[23] = (float)islands;
+}
+
+// Forward pass: input[32] → 256 → 64 → 16 → 1
+static inline float relu(float x) { return x > 0 ? x : 0; }
+
+int evaluate_nnue(const GameState& state) {
+    if (!nnue.loaded) return evaluate_classic(state);
+
+    if (nnue.version == 2) {
+        // v2: raw bitboard input (769 + 8 style → 512 → 32 → 1)
+        float input[777]; // 769 board + 8 style
+        // Extract 768 bits from 12 bitboards
+        for (int bb = 0; bb < 12; bb++) {
+            uint64_t board = state.bitboards[bb];
+            for (int sq = 0; sq < 64; sq++) {
+                input[bb * 64 + sq] = (board & (1ULL << sq)) ? 1.0f : 0.0f;
+            }
+        }
+        // Side to move
+        input[768] = (state.sideToMove == COLOR_BLACK) ? 1.0f : 0.0f;
+        // Style embedding
+        int style_off = nnue.active_style * nnue.style_dim;
+        for (int i = 0; i < nnue.style_dim; i++)
+            input[769 + i] = nnue.style_embed[style_off + i];
+
+        int in_dim = 769 + nnue.style_dim; // 777
+
+        // Layer 1: [512, 777] × [777] + [512] → ReLU
+        float h1[512];
+        for (int o = 0; o < 512; o++) {
+            float sum = nnue.fc1_b[o];
+            for (int i = 0; i < in_dim; i++) sum += nnue.fc1_w[o * in_dim + i] * input[i];
+            h1[o] = relu(sum);
+        }
+
+        // Layer 2: [32, 512] × [512] + [32] → ReLU
+        float h2[32];
+        for (int o = 0; o < 32; o++) {
+            float sum = nnue.fc2_b[o];
+            for (int i = 0; i < 512; i++) sum += nnue.fc2_w[o * 512 + i] * h1[i];
+            h2[o] = relu(sum);
+        }
+
+        // Layer 3 (output): [1, 32] × [32] + [1]
+        float out = nnue.fc3_b[0];
+        for (int i = 0; i < 32; i++) out += nnue.fc3_w[i] * h2[i];
+
+        int eval_cp = (int)(out * nnue.eval_sd + nnue.eval_mean);
+        if (eval_cp > 30000) eval_cp = 30000;
+        if (eval_cp < -30000) eval_cp = -30000;
+        return eval_cp;
+    }
+
+    // v1: scalar features (legacy)
+    float features[24];
+    extract_features(state, features);
+    for (int i = 0; i < nnue.n_features; i++)
+        features[i] = (features[i] - nnue.means[i]) / nnue.sds[i];
+
+    float input[32];
+    for (int i = 0; i < nnue.n_features; i++) input[i] = features[i];
+    int style_off = nnue.active_style * nnue.style_dim;
+    for (int i = 0; i < nnue.style_dim; i++) input[nnue.n_features + i] = nnue.style_embed[style_off + i];
+    int in_dim = nnue.n_features + nnue.style_dim;
+
+    float h1[256];
+    for (int o = 0; o < 256; o++) {
+        float sum = nnue.fc1_b[o];
+        for (int i = 0; i < in_dim; i++) sum += nnue.fc1_w[o * in_dim + i] * input[i];
+        h1[o] = relu(sum);
+    }
+    float h2[64];
+    for (int o = 0; o < 64; o++) {
+        float sum = nnue.fc2_b[o];
+        for (int i = 0; i < 256; i++) sum += nnue.fc2_w[o * 256 + i] * h1[i];
+        h2[o] = relu(sum);
+    }
+    float h3[16];
+    for (int o = 0; o < 16; o++) {
+        float sum = nnue.fc3_b[o];
+        for (int i = 0; i < 64; i++) sum += nnue.fc3_w[o * 64 + i] * h2[i];
+        h3[o] = relu(sum);
+    }
+    float out = nnue.fc4_b[0];
+    for (int i = 0; i < 16; i++) out += nnue.fc4_w[i] * h3[i];
+
+    int eval_cp = (int)(out * nnue.eval_sd + nnue.eval_mean);
+    if (eval_cp > 30000) eval_cp = 30000;
+    if (eval_cp < -30000) eval_cp = -30000;
+    return eval_cp;
+}
+
+// Active evaluation: dispatches to NNUE if loaded, otherwise classic
 int evaluate(const GameState& state) {
+    if (nnue.loaded) return evaluate_nnue(state);
     return evaluate_classic(state);
 }
 

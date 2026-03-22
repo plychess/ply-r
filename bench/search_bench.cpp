@@ -17,6 +17,15 @@ int main() {
     init_attack_tables();
     init_zobrist();
 
+    // Try to load NNUE
+    if (load_nnue("training/nnue_v2_weights.bin")) {
+        printf("Eval: NNUE v2 (bitboard, style-conditioned)\n");
+    } else if (load_nnue("training/nnue_weights.bin")) {
+        printf("Eval: NNUE v1 (scalar, style-conditioned)\n");
+    } else {
+        printf("Eval: Classic (PST + mobility)\n");
+    }
+
     BenchPos positions[] = {
         {"Starting pos",     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",                    7},
         {"Kiwipete",         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",       6},

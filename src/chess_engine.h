@@ -205,8 +205,15 @@ uint64_t position_hash(const GameState& state);
 // Static evaluation (centipawns, from White's perspective)
 // evaluate_classic: hand-crafted PST + mobility + check + king safety (~1550 ELO)
 int evaluate_classic(const GameState& state);
-// evaluate: active evaluation function (defaults to classic, will be swapped for NNUE)
+// evaluate_nnue: neural network eval (style-conditioned, ~10x better than classic)
+int evaluate_nnue(const GameState& state);
+// evaluate: active evaluation function
 int evaluate(const GameState& state);
+
+// NNUE management
+bool load_nnue(const std::string& weights_path);
+void set_nnue_style(int player_id);  // 0=Tal, 1=Karpov
+bool nnue_loaded();
 
 // Search
 struct SearchResult {
