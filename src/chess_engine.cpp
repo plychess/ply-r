@@ -2005,7 +2005,7 @@ static const int* PST_ALL[6] = {
 
 static const int PIECE_VALUES_CP[6] = { 100, 320, 330, 500, 900, 20000 };
 
-int evaluate(const GameState& state) {
+int evaluate_classic(const GameState& state) {
     int score = 0;
 
     // Material + piece-square tables
@@ -2091,6 +2091,11 @@ int evaluate(const GameState& state) {
     }
 
     return score;
+}
+
+// Active evaluation: dispatches to classic or NNUE (future)
+int evaluate(const GameState& state) {
+    return evaluate_classic(state);
 }
 
 // ============================================================

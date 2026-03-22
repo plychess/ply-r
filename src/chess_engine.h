@@ -203,6 +203,9 @@ std::string ply_to_uci(uint32_t ply);
 uint64_t position_hash(const GameState& state);
 
 // Static evaluation (centipawns, from White's perspective)
+// evaluate_classic: hand-crafted PST + mobility + check + king safety (~1550 ELO)
+int evaluate_classic(const GameState& state);
+// evaluate: active evaluation function (defaults to classic, will be swapped for NNUE)
 int evaluate(const GameState& state);
 
 // Search
