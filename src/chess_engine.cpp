@@ -5,6 +5,9 @@
 #include <sstream>
 #include <algorithm>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 namespace chess {
 
@@ -2094,6 +2097,112 @@ int evaluate(const GameState& state) {
 // Search — Alpha-Beta with move ordering + quiescence
 // ============================================================
 
+// Static Exchange Evaluation: determine if a capture sequence wins material
+static const int SEE_VALUES[6] = { 100, 320, 330, 500, 900, 20000 };
+
+static int see(const GameState& state, uint8_t to_sq, uint8_t side,
+               uint64_t occ, int captured_val) {
+    // Find least valuable attacker of 'side' on 'to_sq'
+    uint8_t off = (side == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    int attacker_val = 0;
+    uint64_t attacker_bit = 0;
+
+    // Pawns
+    uint64_t pawns = state.bitboards[off + PIECE_PAWN] & occ;
+    uint64_t pawn_atk = PAWN_ATTACKS[side ^ 1][to_sq]; // squares that attack to_sq
+    if (pawns & pawn_atk) {
+        attacker_bit = (pawns & pawn_atk) & (~(pawns & pawn_atk) + 1); // LSB
+        attacker_val = SEE_VALUES[0];
+    }
+    // Knights
+    if (!attacker_bit) {
+        uint64_t knights = state.bitboards[off + PIECE_KNIGHT] & occ;
+        uint64_t katk = knight_attacks(to_sq);
+        if (knights & katk) {
+            attacker_bit = (knights & katk) & (~(knights & katk) + 1);
+            attacker_val = SEE_VALUES[1];
+        }
+    }
+    // Bishops
+    if (!attacker_bit) {
+        uint64_t bishops = state.bitboards[off + PIECE_BISHOP] & occ;
+        uint64_t batk = bishop_attacks(to_sq, occ);
+        if (bishops & batk) {
+            attacker_bit = (bishops & batk) & (~(bishops & batk) + 1);
+            attacker_val = SEE_VALUES[2];
+        }
+    }
+    // Rooks
+    if (!attacker_bit) {
+        uint64_t rooks = state.bitboards[off + PIECE_ROOK] & occ;
+        uint64_t ratk = rook_attacks(to_sq, occ);
+        if (rooks & ratk) {
+            attacker_bit = (rooks & ratk) & (~(rooks & ratk) + 1);
+            attacker_val = SEE_VALUES[3];
+        }
+    }
+    // Queens
+    if (!attacker_bit) {
+        uint64_t queens = state.bitboards[off + PIECE_QUEEN] & occ;
+        uint64_t qatk = bishop_attacks(to_sq, occ) | rook_attacks(to_sq, occ);
+        if (queens & qatk) {
+            attacker_bit = (queens & qatk) & (~(queens & qatk) + 1);
+            attacker_val = SEE_VALUES[4];
+        }
+    }
+    // King
+    if (!attacker_bit) {
+        uint64_t king = state.bitboards[off + PIECE_KING] & occ;
+        if (king & king_attacks(to_sq)) {
+            attacker_bit = king & king_attacks(to_sq);
+            attacker_val = SEE_VALUES[5];
+        }
+    }
+
+    if (!attacker_bit) return 0; // no attacker
+
+    // Recursively evaluate the exchange
+    int value = captured_val - see(state, to_sq, side ^ 1, occ & ~attacker_bit, attacker_val);
+    return (value > 0) ? value : 0; // stand pat: don't make losing captures
+}
+
+// SEE for a move: returns true if the capture doesn't lose material
+static bool see_ge(const GameState& state, uint32_t move, int threshold) {
+    uint8_t from, to, promo;
+    decode_ply(move, from, to, promo);
+
+    uint8_t off = (state.sideToMove == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (state.sideToMove == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
+
+    // Find attacker value
+    int attacker_val = 0;
+    for (int p = 0; p < 6; p++) {
+        if (state.bitboards[off + p] & (1ULL << from)) { attacker_val = SEE_VALUES[p]; break; }
+    }
+
+    // Find victim value
+    int victim_val = 0;
+    for (int p = 0; p < 6; p++) {
+        if (state.bitboards[opp_off + p] & (1ULL << to)) { victim_val = SEE_VALUES[p]; break; }
+    }
+    // En passant
+    if (attacker_val == SEE_VALUES[0] && to == state.enPassantSquare && state.enPassantSquare != NO_EP) {
+        victim_val = SEE_VALUES[0];
+    }
+
+    if (victim_val == 0) return threshold <= 0; // not a capture
+
+    // Quick check: if we win even if opponent recaptures
+    int balance = victim_val - attacker_val;
+    if (balance >= threshold) return true;
+
+    // Full SEE
+    uint64_t occ = side_occupancy(state, COLOR_WHITE) | side_occupancy(state, COLOR_BLACK);
+    occ &= ~(1ULL << from);
+    int see_val = victim_val - see(state, to, state.sideToMove ^ 1, occ, attacker_val);
+    return see_val >= threshold;
+}
+
 static const int MVV_LVA[6][6] = {
     // victim:  P    N    B    R    Q    K     attacker:
     {  105, 205, 305, 405, 505, 605 },  // P
@@ -2162,14 +2271,104 @@ static void order_moves(const GameState& state, uint32_t* moves, int count) {
     }
 }
 
-static uint64_t search_nodes = 0;
+// ---- Transposition table for search ----
+
+enum TTFlag : uint8_t { TT_EXACT = 0, TT_ALPHA = 1, TT_BETA = 2 };
+
+struct SearchTTEntry {
+    uint64_t key;
+    int32_t  score;
+    uint32_t best_move;
+    uint8_t  depth;
+    uint8_t  flag;
+};
+
+static constexpr size_t SEARCH_TT_SIZE = 1 << 24; // 16M entries (~384MB)
+static constexpr size_t SEARCH_TT_MASK = SEARCH_TT_SIZE - 1;
+static SearchTTEntry search_tt[SEARCH_TT_SIZE]; // shared across threads
+static std::atomic<uint64_t> search_nodes{0};
+
+// Per-thread search state
+static constexpr int MAX_PLY = 128;
+
+struct ThreadState {
+    uint32_t killers[MAX_PLY][2];
+    int history[2][64][64];
+    void clear() {
+        memset(killers, 0, sizeof(killers));
+        memset(history, 0, sizeof(history));
+    }
+};
+
+static void clear_search_tt() {
+    memset(search_tt, 0, sizeof(search_tt));
+}
+
+static int tt_probe(uint64_t key, int depth, int alpha, int beta, uint32_t& tt_move) {
+    SearchTTEntry& e = search_tt[key & SEARCH_TT_MASK];
+    tt_move = 0;
+    if (e.key == key) {
+        tt_move = e.best_move;
+        if (e.depth >= depth) {
+            if (e.flag == TT_EXACT) return e.score;
+            if (e.flag == TT_ALPHA && e.score <= alpha) return alpha;
+            if (e.flag == TT_BETA  && e.score >= beta)  return beta;
+        }
+    }
+    return -1111111; // sentinel: no usable entry
+}
+
+static void tt_store(uint64_t key, int depth, int score, uint8_t flag, uint32_t best_move) {
+    SearchTTEntry& e = search_tt[key & SEARCH_TT_MASK];
+    if (e.key == key && e.depth > depth) return; // don't overwrite deeper entry for same position
+    e.key = key;
+    e.score = score;
+    e.best_move = best_move;
+    e.depth = static_cast<uint8_t>(depth);
+    e.flag = flag;
+}
+
+// Move ordering: TT move > captures (MVV-LVA) > killers > history
+static void order_moves_full(const GameState& state, uint32_t* moves, int count,
+                              uint32_t tt_move, int ply, const ThreadState& ts) {
+    int scores[256];
+    for (int i = 0; i < count; i++) {
+        if (moves[i] == tt_move) {
+            scores[i] = 100000;
+        } else {
+            int s = score_move(state, moves[i]);
+            if (s > 0) {
+                scores[i] = s + 10000;
+            } else if (ply < MAX_PLY && moves[i] == ts.killers[ply][0]) {
+                scores[i] = 9000;
+            } else if (ply < MAX_PLY && moves[i] == ts.killers[ply][1]) {
+                scores[i] = 8000;
+            } else {
+                uint8_t mf, mt, mp;
+                decode_ply(moves[i], mf, mt, mp);
+                scores[i] = ts.history[state.sideToMove][mf][mt];
+            }
+        }
+    }
+    for (int i = 1; i < count; i++) {
+        int key_score = scores[i];
+        uint32_t key_move = moves[i];
+        int j = i - 1;
+        while (j >= 0 && scores[j] < key_score) {
+            scores[j + 1] = scores[j];
+            moves[j + 1] = moves[j];
+            j--;
+        }
+        scores[j + 1] = key_score;
+        moves[j + 1] = key_move;
+    }
+}
 
 // Quiescence search: only look at captures to avoid horizon effect
 static int quiescence(const GameState& state, int alpha, int beta) {
     search_nodes++;
 
     int stand_pat = evaluate(state);
-    // Flip sign: evaluate() returns from White's perspective
     if (state.sideToMove == COLOR_BLACK) stand_pat = -stand_pat;
 
     if (stand_pat >= beta) return beta;
@@ -2177,8 +2376,8 @@ static int quiescence(const GameState& state, int alpha, int beta) {
 
     uint32_t moves[256];
     int count = generate_legal_moves_fast(state, moves);
+    order_moves(state, moves, count); // MVV-LVA for captures
 
-    // Only search captures
     uint64_t opp_occ = side_occupancy(state, state.sideToMove ^ 1);
     for (int i = 0; i < count; i++) {
         uint8_t from, to, promo;
@@ -2186,13 +2385,22 @@ static int quiescence(const GameState& state, int alpha, int beta) {
         uint64_t to_mask = 1ULL << to;
 
         bool is_capture = (opp_occ & to_mask) != 0;
-        // En passant
         if (!is_capture && (state.bitboards[(state.sideToMove == COLOR_WHITE ? WHITE_OFFSET : BLACK_OFFSET) + PIECE_PAWN] & (1ULL << from))
             && to == state.enPassantSquare && state.enPassantSquare != NO_EP) {
             is_capture = true;
         }
-
         if (!is_capture && promo == 0) continue;
+
+        // Delta pruning: skip captures that can't possibly raise alpha
+        if (is_capture && promo == 0) {
+            static const int DELTA_MARGIN = 200;
+            int victim_val = 0;
+            uint8_t opp_off = (state.sideToMove == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
+            for (int p = 0; p < 5; p++) {
+                if (state.bitboards[opp_off + p] & to_mask) { victim_val = PIECE_VALUES_CP[p]; break; }
+            }
+            if (stand_pat + victim_val + DELTA_MARGIN < alpha) continue;
+        }
 
         GameState next = apply_ply_to_memory(state, moves[i]);
         int score = -quiescence(next, -beta, -alpha);
@@ -2204,39 +2412,186 @@ static int quiescence(const GameState& state, int alpha, int beta) {
     return alpha;
 }
 
-// Alpha-beta search with negamax framework
-static int alpha_beta(const GameState& state, int depth, int alpha, int beta) {
+// PVS alpha-beta with TT + null move + LMR + SEE + IID + singular extensions
+static int alpha_beta(const GameState& state, int depth, int alpha, int beta,
+                       bool do_null, int ply, ThreadState& ts) {
     if (depth <= 0) return quiescence(state, alpha, beta);
 
-    search_nodes++;
+    search_nodes.fetch_add(1, std::memory_order_relaxed);
+    uint64_t key = state.hash;
+    bool is_pv = (beta - alpha > 1);
+    bool is_check = in_check(state, state.sideToMove);
+
+    if (is_check) depth++;
+
+    // TT probe
+    uint32_t tt_move = 0;
+    int tt_score = tt_probe(key, depth, alpha, beta, tt_move);
+    if (tt_score != -1111111 && !is_pv) return tt_score;
+
+    // Static eval for pruning decisions
+    int static_eval = evaluate(state);
+    if (state.sideToMove == COLOR_BLACK) static_eval = -static_eval;
+
+    // Reverse futility pruning (static eval based)
+    if (!is_check && !is_pv && depth <= 6) {
+        int margin = depth * 80;
+        if (static_eval - margin >= beta) return static_eval;
+    }
+
+    // Razoring: at shallow depth, if eval is way below alpha, drop to qsearch
+    if (!is_check && !is_pv && depth <= 2) {
+        int margin = 300 + depth * 60;
+        if (static_eval + margin <= alpha) {
+            int q = quiescence(state, alpha, beta);
+            if (q <= alpha) return q;
+        }
+    }
+
+    // Null move pruning
+    if (do_null && !is_check && !is_pv && depth >= 3 && static_eval >= beta) {
+        GameState null_state = state;
+        null_state.sideToMove ^= 1;
+        null_state.enPassantSquare = NO_EP;
+        int R = 3 + depth / 4;
+        int null_score = -alpha_beta(null_state, depth - 1 - R, -beta, -beta + 1, false, ply + 1, ts);
+        if (null_score >= beta) {
+            if (null_score >= 900000) null_score = beta; // don't trust mate scores from null move
+            return null_score;
+        }
+    }
 
     uint32_t moves[256];
     int count = generate_legal_moves_fast(state, moves);
 
-    // No legal moves: checkmate or stalemate
     if (count == 0) {
-        if (in_check(state, state.sideToMove)) return -999999 + (100 - depth); // checkmate (prefer shorter)
-        return 0; // stalemate
+        if (is_check) return -999999 + ply;
+        return 0;
     }
 
-    // Move ordering
-    order_moves(state, moves, count);
+    // Internal iterative deepening: if no TT move, do a shallow search to find one
+    if (!tt_move && depth >= 4 && is_pv) {
+        alpha_beta(state, depth - 2, alpha, beta, false, ply, ts);
+        tt_probe(key, depth - 2, alpha, beta, tt_move); // get the TT move from shallow search
+    }
 
-    // Check extension: if in check, search one ply deeper
-    int extension = in_check(state, state.sideToMove) ? 1 : 0;
+    order_moves_full(state, moves, count, tt_move, ply, ts);
+
+    // Singular extension detection: is the TT move significantly better?
+    int singular_ext = 0;
+    if (tt_move && depth >= 6 && !is_check) {
+        SearchTTEntry& tte = search_tt[key & SEARCH_TT_MASK];
+        if (tte.key == key && tte.depth >= depth - 3 && tte.flag != TT_ALPHA) {
+            int s_beta = tte.score - depth * 2;
+            // Search all moves except TT move at reduced depth with narrow window
+            int excluded_best = -999999;
+            for (int i = 0; i < count; i++) {
+                if (moves[i] == tt_move) continue;
+                GameState next = apply_ply_to_memory(state, moves[i]);
+                int s = -alpha_beta(next, depth / 2 - 1, -s_beta - 1, -s_beta, false, ply + 1, ts);
+                if (s > excluded_best) excluded_best = s;
+                if (excluded_best >= s_beta) break; // someone else is good enough
+            }
+            if (excluded_best < s_beta) singular_ext = 1; // TT move is singular, extend it
+        }
+    }
+
+    int best_score = -999999;
+    uint32_t best_move = moves[0];
+    uint8_t tt_flag = TT_ALPHA;
+    int moves_searched = 0;
 
     for (int i = 0; i < count; i++) {
-        GameState next = apply_ply_to_memory(state, moves[i]);
-        int score = -alpha_beta(next, depth - 1 + extension, -beta, -alpha);
+        uint8_t mf, mt, mp;
+        decode_ply(moves[i], mf, mt, mp);
+        uint64_t opp_occ = side_occupancy(state, state.sideToMove ^ 1);
+        bool is_cap = (opp_occ & (1ULL << mt)) != 0;
 
-        if (score >= beta) return beta;   // beta cutoff
-        if (score > alpha) alpha = score;
+        // Late move pruning: skip very late quiet moves at shallow depth
+        if (!is_pv && !is_check && depth <= 4 && moves_searched >= (3 + depth * depth) && !is_cap && mp == 0) {
+            continue;
+        }
+
+        // SEE pruning: skip losing captures at non-PV nodes
+        if (!is_pv && moves_searched > 0 && is_cap && depth <= 4) {
+            if (!see_ge(state, moves[i], 0)) continue;
+        }
+
+        GameState next = apply_ply_to_memory(state, moves[i]);
+        int score;
+
+        // Extension for singular TT move
+        int ext = (moves[i] == tt_move) ? singular_ext : 0;
+
+        if (moves_searched == 0) {
+            score = -alpha_beta(next, depth - 1 + ext, -beta, -alpha, true, ply + 1, ts);
+        } else {
+            // LMR: more aggressive reductions
+            int reduction = 0;
+            if (moves_searched >= 2 && depth >= 3 && !is_cap && mp == 0) {
+                bool gives_chk = in_check(next, next.sideToMove);
+                if (!gives_chk && !is_check) {
+                    // Base reduction from log table
+                    reduction = 1 + (int)(0.5 * (depth > 1 ? depth - 1 : 0) * (moves_searched > 1 ? moves_searched - 1 : 0)) / 12;
+                    if (reduction > depth - 2) reduction = depth - 2;
+                    if (reduction < 0) reduction = 0;
+
+                    // Reduce more for non-PV nodes
+                    if (!is_pv) reduction++;
+
+                    // Reduce less for killer moves
+                    if (ply < MAX_PLY && (moves[i] == ts.killers[ply][0] || moves[i] == ts.killers[ply][1]))
+                        reduction--;
+
+                    if (reduction < 0) reduction = 0;
+                }
+            }
+
+            // PVS null window
+            score = -alpha_beta(next, depth - 1 - reduction + ext, -alpha - 1, -alpha, true, ply + 1, ts);
+
+            if (score > alpha && (reduction > 0 || score < beta)) {
+                score = -alpha_beta(next, depth - 1 + ext, -beta, -alpha, true, ply + 1, ts);
+            }
+        }
+
+        moves_searched++;
+
+        if (score > best_score) {
+            best_score = score;
+            best_move = moves[i];
+        }
+        if (score > alpha) {
+            alpha = score;
+            tt_flag = TT_EXACT;
+        }
+        if (score >= beta) {
+            tt_store(key, depth, beta, TT_BETA, best_move);
+            if (!is_cap && mp == 0 && ply < MAX_PLY) {
+                if (ts.killers[ply][0] != moves[i]) {
+                    ts.killers[ply][1] = ts.killers[ply][0];
+                    ts.killers[ply][0] = moves[i];
+                }
+                ts.history[state.sideToMove][mf][mt] += depth * depth;
+                if (ts.history[state.sideToMove][mf][mt] > 100000) {
+                    for (int a = 0; a < 64; a++)
+                        for (int b = 0; b < 64; b++) {
+                            ts.history[0][a][b] >>= 1;
+                            ts.history[1][a][b] >>= 1;
+                        }
+                }
+            }
+            return beta;
+        }
     }
 
-    return alpha;
+    tt_store(key, depth, best_score, tt_flag, best_move);
+    return best_score;
 }
 
-SearchResult find_best_move(const GameState& state, int max_depth) {
+// Single-thread iterative deepening search (used by each SMP thread)
+static SearchResult search_single(const GameState& state, int max_depth,
+                                   int depth_offset, ThreadState& ts) {
     SearchResult result = {0, 0, 0, 0};
 
     uint32_t moves[256];
@@ -2244,40 +2599,58 @@ SearchResult find_best_move(const GameState& state, int max_depth) {
     if (count == 0) return result;
 
     order_moves(state, moves, count);
-
-    // Iterative deepening
-    uint32_t best_move = moves[0];
-    int best_score = -999999;
+    int prev_score = 0;
 
     for (int depth = 1; depth <= max_depth; depth++) {
-        search_nodes = 0;
-        int alpha = -999999;
-        int beta  =  999999;
+        // Lazy SMP: helper threads search at slightly different depths
+        int effective_depth = depth + depth_offset;
+        if (effective_depth > max_depth) break;
+        if (effective_depth < 1) continue;
+
+        int alpha, beta;
+        if (depth >= 4) {
+            alpha = prev_score - 50;
+            beta  = prev_score + 50;
+        } else {
+            alpha = -999999;
+            beta  =  999999;
+        }
+
         uint32_t depth_best = moves[0];
         int depth_score = -999999;
 
-        for (int i = 0; i < count; i++) {
-            GameState next = apply_ply_to_memory(state, moves[i]);
-            int score = -alpha_beta(next, depth - 1, -beta, -alpha);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            depth_score = -999999;
+            depth_best = moves[0];
 
-            if (score > depth_score) {
-                depth_score = score;
-                depth_best = moves[i];
+            for (int i = 0; i < count; i++) {
+                GameState next = apply_ply_to_memory(state, moves[i]);
+                int score = -alpha_beta(next, effective_depth - 1, -beta, -alpha, true, 1, ts);
+
+                if (score > depth_score) {
+                    depth_score = score;
+                    depth_best = moves[i];
+                }
+                if (score > alpha) alpha = score;
             }
-            if (score > alpha) alpha = score;
+
+            if (depth_score <= alpha - 50 + 1 || depth_score >= beta) {
+                alpha = -999999;
+                beta  =  999999;
+            } else {
+                break;
+            }
         }
 
-        best_move  = depth_best;
-        best_score = depth_score;
-        result.best_move = best_move;
-        result.score     = best_score;
-        result.depth     = depth;
-        result.nodes     = search_nodes;
+        prev_score = depth_score;
+        result.best_move = depth_best;
+        result.score     = depth_score;
+        result.depth     = effective_depth;
+        result.nodes     = search_nodes.load(std::memory_order_relaxed);
 
         // Put best move first for next iteration
         for (int i = 0; i < count; i++) {
-            if (moves[i] == best_move) {
-                // Swap to front
+            if (moves[i] == depth_best) {
                 uint32_t tmp = moves[0];
                 moves[0] = moves[i];
                 moves[i] = tmp;
@@ -2287,6 +2660,51 @@ SearchResult find_best_move(const GameState& state, int max_depth) {
     }
 
     return result;
+}
+
+SearchResult find_best_move(const GameState& state, int max_depth) {
+    uint32_t moves[256];
+    int count = generate_legal_moves_fast(state, moves);
+    if (count == 0) return {0, 0, 0, 0};
+
+    clear_search_tt();
+    search_nodes.store(0, std::memory_order_relaxed);
+
+    int n_threads = std::thread::hardware_concurrency();
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 32) n_threads = 32;
+
+    // Single-threaded for shallow searches
+    if (max_depth <= 4 || n_threads == 1) {
+        ThreadState ts;
+        ts.clear();
+        return search_single(state, max_depth, 0, ts);
+    }
+
+    // Lazy SMP: all threads search the same position with shared TT
+    // Main thread searches at target depth; helpers search at ±1, ±2 depths
+    std::vector<SearchResult> results(n_threads);
+    std::vector<ThreadState> thread_states(n_threads);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; t++) {
+        thread_states[t].clear();
+        // Depth offsets: 0, +1, -1, +2, -2, ... (main thread gets 0)
+        int offset = 0;
+        if (t > 0) {
+            offset = ((t + 1) / 2) * ((t % 2 == 1) ? 1 : -1);
+        }
+        threads.emplace_back([&, t, offset]() {
+            results[t] = search_single(state, max_depth, offset, thread_states[t]);
+        });
+    }
+
+    for (auto& th : threads) th.join();
+
+    // Main thread result (thread 0) is authoritative
+    SearchResult best = results[0];
+    best.nodes = search_nodes.load(std::memory_order_relaxed);
+    return best;
 }
 
 } // namespace chess
