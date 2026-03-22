@@ -1,0 +1,126 @@
+---
+title: "Classifying and Evaluating Chess Move Decisions: From Supervised Learning to Reinforcement Learning"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+geometry: top=12pt, includehead, headheight=14pt, headsep=6pt, left=0.5in, right=0.5in, bottom=0.5in
+fontsize: 10pt
+header-includes:
+  - \usepackage{fancyhdr}
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - \pagestyle{fancy}
+  - \fancypagestyle{plain}{\pagestyle{fancy}}
+  - \fancyhf{}
+  - \fancyhead[L]{\small\hspace{0.15in} Qusai Jouda}
+  - \fancyhead[R]{\small AII600\ \textbar\ Spring 2026\ \textbar\ Final Project Report \hspace{0.15in}}
+  - \fancyfoot[C]{\thepage}
+  - \setlength{\parskip}{2pt plus 1pt}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+# 1. Introduction and Midterm Recap
+
+The midterm project classified chess move types from board-state features using multinomial logistic regression (78.4% accuracy) and Naive Bayes on Mikhail Tal's 2,431 career games. The key finding was that *counting available options is not the same as evaluating them* --- scalar features describing tactical availability could not distinguish sound sacrifices from bad ones.
+
+This final project extends the midterm in three ways, each using methods taught after the midterm: (1) **tree-based models** (XGBoost) for capturing feature interactions, (2) **neural networks** for position evaluation, and (3) **reinforcement learning** (Monte Carlo Q-learning) for evaluating move decisions against game outcomes.
+
+# 2. Data
+
+The dataset remains Tal's 2,431 game records (86,861 positions). Each position is enriched with 50 C++ features via a custom bitboard chess engine, including a static evaluation function that scores each legal move. After feature importance analysis and correlation pruning, 28 non-redundant features are used. A 6-class move taxonomy is used: quiet\_forced, quiet\_restrained, trade, winning\_capture, sacrifice, and check.
+
+For reinforcement learning, Stockfish depth-8 evaluations were generated for all positions (234,499 including Karpov's 147,638 positions for style comparison).
+
+# 3. Methods and Results
+
+## 3.1 Tree Models (XGBoost)
+
+XGBoost captures feature interactions that logistic regression cannot (e.g., "open king file + high mobility + negative capture net $\Rightarrow$ sacrifice likely"). Table 1 shows the progression.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Model accuracy and sacrifice sensitivity across methods.}
+\begin{tabular}{lccc}
+\toprule
+Model & Features & Accuracy & Sacrifice Sens. \\
+\midrule
+Midterm (LR) & 24 & 78.4\% & 24.5\% \\
++ Evaluative features (LR) & 27 & 81.7\% & 44.1\% \\
++ XGBoost & 27 & 87.7\% & 60.6\% \\
++ Static eval features & 37 & 95.8\% & 94.4\% \\
++ Feature pruning & 28 & \textbf{96.5\%} & \textbf{94.3\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Feature importance analysis revealed that 6 features account for 85\% of XGBoost's information gain, led by \texttt{num\_captures\_avail} (25.3\%) and \texttt{num\_checks\_avail} (15.3\%). The three evaluative features added post-midterm rank 3rd, 4th, and 6th --- confirming that "how good" matters more than "how many."
+
+## 3.2 Neural Network Evaluation
+
+A style-conditioned neural network (768 bitboard inputs + 8-dim style embedding $\rightarrow$ 512 $\rightarrow$ 32 $\rightarrow$ 1) was trained to predict Stockfish evaluations. The network achieves 0.855 correlation with Stockfish (vs 0.055 for the hand-crafted eval) and produces 33.9cp mean evaluation difference between Tal-mode and Karpov-mode for the same position --- confirming that style conditioning is learnable. However, integrating the neural eval into the search engine reduced playing strength due to inference speed limitations, demonstrating that eval accuracy alone is insufficient without computational efficiency.
+
+## 3.3 Reinforcement Learning (Monte Carlo Q-Learning)
+
+Following the course's tic-tac-toe Q-learning framework, chess is framed as an MDP: state = discretized position features, action = move type, reward = game outcome (+1 win, 0 draw, -1 loss). Q(s,a) is estimated via every-visit Monte Carlo with $\gamma = 0.95$.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Mean Q-values by move type (higher = better expected game outcome).}
+\begin{tabular}{lcc}
+\toprule
+Move Type & Mean Q & \% Positive \\
+\midrule
+sacrifice\_check & +0.262 & 74.8\% \\
+check & +0.253 & 76.8\% \\
+winning\_capture & +0.242 & 80.8\% \\
+sacrifice & +0.220 & 77.4\% \\
+trade & +0.179 & 80.1\% \\
+quiet\_restrained & +0.147 & 72.7\% \\
+quiet\_forced & +0.108 & 72.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Sacrifices have \textbf{higher expected return (+0.220) than quiet moves (+0.147)}. This finding is robust across discount factors ($\gamma \in [0, 1]$), reward shaping variants, and TD(0) vs Monte Carlo estimation.
+
+## 3.4 Combined Insight: Classifier $\times$ RL
+
+Combining the classifier ("what happened") with the RL policy ("what should happen") creates a four-quadrant decision framework:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Four quadrants of Tal's decision-making.}
+\begin{tabular}{llcc}
+\toprule
+Quadrant & Description & \% of Moves & Win Rate \\
+\midrule
+GENIUS & Aggressive, RL agrees & 5.5\% & \textbf{55.4\%} \\
+GAMBLE & Aggressive, RL warns & 5.6\% & 45.0\% \\
+MISSED & Quiet, RL says attack & 36.4\% & 45.6\% \\
+SOLID & Quiet, RL agrees & 52.4\% & 41.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+When Tal's aggression aligns with the RL policy (GENIUS), win rate is 55.4\% --- the highest of any quadrant. Even speculative gambles (GAMBLE) win 45\%, above the baseline. The RL suggests Tal was too conservative 36\% of the time (MISSED), with higher win rates than SOLID play.
+
+# 4. Discussion
+
+The supervised classifier answers "what type of move is this?" with 96.5\% accuracy. The RL policy answers "what type should be played to win?" with Q-values favoring aggression. Together, they answer "was this the right decision?" --- a question neither can answer alone.
+
+The core finding, robust across all methods, is that Tal's aggressive style was objectively rewarded: sacrifices have positive expected return, and positions where aggression aligns with the RL policy produce the highest win rates. This is consistent with Kasparov's assessment that Tal's sacrifices "created maximum complexity and put the opponent under unbearable practical pressure" (Kasparov, *My Great Predecessors*, Vol. 2, 2003).
+
+A material-maximizing reward function (reward shaping, $\alpha=1$) eliminates the value of sacrifices entirely --- the agent never sacrifices when optimizing material. Only the game-outcome reward ($\alpha=0$) captures why sacrifices work: they create pressure that induces opponent errors. This demonstrates that chess decision-making cannot be reduced to material optimization.
+
+# 5. Conclusion
+
+This project extends the midterm's logistic regression baseline with three post-midterm methods: XGBoost (96.5\% classification), neural networks (0.855 Stockfish correlation), and reinforcement learning (Q-values confirming aggressive play is rewarded). The combination of supervised classification and RL Q-learning creates a novel framework for evaluating sequential decisions that applies beyond chess to any domain where "what happened" and "what should happen" are both answerable.
+
+\small
+**References:** Kasparov, G. (2003). *My Great Predecessors, Part II*. Everyman Chess. Tal, M. (1976). *The Life and Games of Mikhail Tal*. Everyman Chess.
