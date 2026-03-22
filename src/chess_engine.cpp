@@ -2090,4 +2090,203 @@ int evaluate(const GameState& state) {
     return score;
 }
 
+// ============================================================
+// Search — Alpha-Beta with move ordering + quiescence
+// ============================================================
+
+static const int MVV_LVA[6][6] = {
+    // victim:  P    N    B    R    Q    K     attacker:
+    {  105, 205, 305, 405, 505, 605 },  // P
+    {  104, 204, 304, 404, 504, 604 },  // N
+    {  103, 203, 303, 403, 503, 603 },  // B
+    {  102, 202, 302, 402, 502, 602 },  // R
+    {  101, 201, 301, 401, 501, 601 },  // Q
+    {  100, 200, 300, 400, 500, 600 },  // K
+};
+
+// Score a move for ordering: captures scored by MVV-LVA, quiet moves get 0
+static int score_move(const GameState& state, uint32_t move) {
+    uint8_t from, to, promo;
+    decode_ply(move, from, to, promo);
+
+    uint8_t off     = (state.sideToMove == COLOR_WHITE) ? WHITE_OFFSET : BLACK_OFFSET;
+    uint8_t opp_off = (state.sideToMove == COLOR_WHITE) ? BLACK_OFFSET : WHITE_OFFSET;
+    uint64_t to_mask = 1ULL << to;
+
+    // Find attacker piece type
+    int attacker = -1;
+    uint64_t from_mask = 1ULL << from;
+    for (int p = 0; p < 6; p++) {
+        if (state.bitboards[off + p] & from_mask) { attacker = p; break; }
+    }
+
+    // Find victim piece type
+    int victim = -1;
+    uint64_t opp_occ = side_occupancy(state, state.sideToMove ^ 1);
+    if (opp_occ & to_mask) {
+        for (int p = 0; p < 6; p++) {
+            if (state.bitboards[opp_off + p] & to_mask) { victim = p; break; }
+        }
+    }
+
+    // En passant capture
+    if (attacker == PIECE_PAWN && to == state.enPassantSquare && state.enPassantSquare != NO_EP) {
+        return MVV_LVA[0][0]; // pawn takes pawn
+    }
+
+    if (victim >= 0 && attacker >= 0) {
+        return MVV_LVA[victim][attacker];
+    }
+
+    // Promotion bonus
+    if (promo > 0) return 400 + promo;
+
+    return 0;
+}
+
+static void order_moves(const GameState& state, uint32_t* moves, int count) {
+    // Simple insertion sort by move score (captures first via MVV-LVA)
+    int scores[256];
+    for (int i = 0; i < count; i++) scores[i] = score_move(state, moves[i]);
+    for (int i = 1; i < count; i++) {
+        int key_score = scores[i];
+        uint32_t key_move = moves[i];
+        int j = i - 1;
+        while (j >= 0 && scores[j] < key_score) {
+            scores[j + 1] = scores[j];
+            moves[j + 1] = moves[j];
+            j--;
+        }
+        scores[j + 1] = key_score;
+        moves[j + 1] = key_move;
+    }
+}
+
+static uint64_t search_nodes = 0;
+
+// Quiescence search: only look at captures to avoid horizon effect
+static int quiescence(const GameState& state, int alpha, int beta) {
+    search_nodes++;
+
+    int stand_pat = evaluate(state);
+    // Flip sign: evaluate() returns from White's perspective
+    if (state.sideToMove == COLOR_BLACK) stand_pat = -stand_pat;
+
+    if (stand_pat >= beta) return beta;
+    if (stand_pat > alpha) alpha = stand_pat;
+
+    uint32_t moves[256];
+    int count = generate_legal_moves_fast(state, moves);
+
+    // Only search captures
+    uint64_t opp_occ = side_occupancy(state, state.sideToMove ^ 1);
+    for (int i = 0; i < count; i++) {
+        uint8_t from, to, promo;
+        decode_ply(moves[i], from, to, promo);
+        uint64_t to_mask = 1ULL << to;
+
+        bool is_capture = (opp_occ & to_mask) != 0;
+        // En passant
+        if (!is_capture && (state.bitboards[(state.sideToMove == COLOR_WHITE ? WHITE_OFFSET : BLACK_OFFSET) + PIECE_PAWN] & (1ULL << from))
+            && to == state.enPassantSquare && state.enPassantSquare != NO_EP) {
+            is_capture = true;
+        }
+
+        if (!is_capture && promo == 0) continue;
+
+        GameState next = apply_ply_to_memory(state, moves[i]);
+        int score = -quiescence(next, -beta, -alpha);
+
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+
+    return alpha;
+}
+
+// Alpha-beta search with negamax framework
+static int alpha_beta(const GameState& state, int depth, int alpha, int beta) {
+    if (depth <= 0) return quiescence(state, alpha, beta);
+
+    search_nodes++;
+
+    uint32_t moves[256];
+    int count = generate_legal_moves_fast(state, moves);
+
+    // No legal moves: checkmate or stalemate
+    if (count == 0) {
+        if (in_check(state, state.sideToMove)) return -999999 + (100 - depth); // checkmate (prefer shorter)
+        return 0; // stalemate
+    }
+
+    // Move ordering
+    order_moves(state, moves, count);
+
+    // Check extension: if in check, search one ply deeper
+    int extension = in_check(state, state.sideToMove) ? 1 : 0;
+
+    for (int i = 0; i < count; i++) {
+        GameState next = apply_ply_to_memory(state, moves[i]);
+        int score = -alpha_beta(next, depth - 1 + extension, -beta, -alpha);
+
+        if (score >= beta) return beta;   // beta cutoff
+        if (score > alpha) alpha = score;
+    }
+
+    return alpha;
+}
+
+SearchResult find_best_move(const GameState& state, int max_depth) {
+    SearchResult result = {0, 0, 0, 0};
+
+    uint32_t moves[256];
+    int count = generate_legal_moves_fast(state, moves);
+    if (count == 0) return result;
+
+    order_moves(state, moves, count);
+
+    // Iterative deepening
+    uint32_t best_move = moves[0];
+    int best_score = -999999;
+
+    for (int depth = 1; depth <= max_depth; depth++) {
+        search_nodes = 0;
+        int alpha = -999999;
+        int beta  =  999999;
+        uint32_t depth_best = moves[0];
+        int depth_score = -999999;
+
+        for (int i = 0; i < count; i++) {
+            GameState next = apply_ply_to_memory(state, moves[i]);
+            int score = -alpha_beta(next, depth - 1, -beta, -alpha);
+
+            if (score > depth_score) {
+                depth_score = score;
+                depth_best = moves[i];
+            }
+            if (score > alpha) alpha = score;
+        }
+
+        best_move  = depth_best;
+        best_score = depth_score;
+        result.best_move = best_move;
+        result.score     = best_score;
+        result.depth     = depth;
+        result.nodes     = search_nodes;
+
+        // Put best move first for next iteration
+        for (int i = 0; i < count; i++) {
+            if (moves[i] == best_move) {
+                // Swap to front
+                uint32_t tmp = moves[0];
+                moves[0] = moves[i];
+                moves[i] = tmp;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 } // namespace chess

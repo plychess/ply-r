@@ -205,6 +205,16 @@ uint64_t position_hash(const GameState& state);
 // Static evaluation (centipawns, from White's perspective)
 int evaluate(const GameState& state);
 
+// Search
+struct SearchResult {
+    uint32_t best_move;   // encoded move
+    int score;            // centipawns from side-to-move perspective
+    int depth;            // depth searched
+    uint64_t nodes;       // nodes visited
+};
+
+SearchResult find_best_move(const GameState& state, int max_depth);
+
 } // namespace chess
 
 #endif // CHESS_ENGINE_H
