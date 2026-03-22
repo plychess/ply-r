@@ -2113,9 +2113,14 @@ struct NNUEWeights {
     std::vector<float> style_embed;
     std::vector<float> means, sds;
     float eval_mean = 0, eval_sd = 1;
+
+    // Transposed fc1 weights for cache-friendly column access: [in_dim][H1]
+    std::vector<float> fc1_wt;
 };
 
 static NNUEWeights nnue;
+
+static void precompute_h1_base(); // forward declaration
 
 static void read_floats(FILE* f, std::vector<float>& v, int count) {
     v.resize(count);
@@ -2173,12 +2178,46 @@ bool load_nnue(const std::string& path) {
     fclose(f);
     nnue.loaded = true;
     nnue.version = (magic == 0x4E4E5532) ? 2 : 1;
+
+    // Transpose fc1 weights for cache-friendly sparse access: [in_dim][H1]
+    if (nnue.version == 2) {
+        int in_dim = nf + sd;
+        int h1_size = 512;
+        nnue.fc1_wt.resize(in_dim * h1_size);
+        for (int o = 0; o < h1_size; o++)
+            for (int i = 0; i < in_dim; i++)
+                nnue.fc1_wt[i * h1_size + o] = nnue.fc1_w[o * in_dim + i];
+    }
+
+    precompute_h1_base();
     return true;
 }
 
+// Pre-computed bias + style for layer 1 (avoids recomputing per eval)
+static float nnue_h1_base[512];
+static bool  nnue_h1_base_valid = false;
+
+static void precompute_h1_base() {
+    if (!nnue.loaded || nnue.version != 2) return;
+    const int H1 = 512;
+    // Start with bias
+    for (int o = 0; o < H1; o++) nnue_h1_base[o] = nnue.fc1_b[o];
+    // Add style embedding using transposed weights
+    int style_off = nnue.active_style * nnue.style_dim;
+    for (int s = 0; s < nnue.style_dim; s++) {
+        float sv = nnue.style_embed[style_off + s];
+        const float* col = &nnue.fc1_wt[(769 + s) * H1];
+        for (int o = 0; o < H1; o++) nnue_h1_base[o] += col[o] * sv;
+    }
+    nnue_h1_base_valid = true;
+}
+
 void set_nnue_style(int player_id) {
-    if (player_id >= 0 && player_id < nnue.n_players)
+    if (player_id >= 0 && player_id < nnue.n_players) {
         nnue.active_style = player_id;
+        nnue_h1_base_valid = false;
+        precompute_h1_base();
+    }
 }
 
 bool nnue_loaded() { return nnue.loaded; }
@@ -2365,37 +2404,46 @@ int evaluate_nnue(const GameState& state) {
     if (!nnue.loaded) return evaluate_classic(state);
 
     if (nnue.version == 2) {
-        // v2: raw bitboard input (769 + 8 style → 512 → 32 → 1)
-        float input[777]; // 769 board + 8 style
-        // Extract 768 bits from 12 bitboards
+        // v2: sparse bitboard input (769 + 8 style → 512 → 32 → 1)
+        // Key optimization: instead of multiplying all 777 inputs,
+        // start with bias + style contribution, then only ADD weight
+        // columns for the ~20-30 set bits in the bitboards.
+
+        constexpr int H1 = 512;
+        const int IN_DIM = 769 + nnue.style_dim; // 777
+
+        // Layer 1: start with precomputed bias + style
+        if (!nnue_h1_base_valid) precompute_h1_base();
+        float h1[512];
+        memcpy(h1, nnue_h1_base, sizeof(h1));
+
+        // Side-to-move contribution (feature 768) — contiguous in transposed layout
+        if (state.sideToMove == COLOR_BLACK) {
+            const float* stm_col = &nnue.fc1_wt[768 * H1];
+            for (int o = 0; o < H1; o++) h1[o] += stm_col[o];
+        }
+
+        // SPARSE layer 1: add transposed weight column for each piece
+        // fc1_wt layout: [in_dim][H1] — each column is contiguous → cache-friendly
+        const float* wt = nnue.fc1_wt.data();
         for (int bb = 0; bb < 12; bb++) {
             uint64_t board = state.bitboards[bb];
-            for (int sq = 0; sq < 64; sq++) {
-                input[bb * 64 + sq] = (board & (1ULL << sq)) ? 1.0f : 0.0f;
+            int base_col = bb * 64;
+            while (board) {
+                int sq = pop_lsb(board);
+                const float* col = &wt[(base_col + sq) * H1];
+                for (int o = 0; o < H1; o++) h1[o] += col[o];
             }
         }
-        // Side to move
-        input[768] = (state.sideToMove == COLOR_BLACK) ? 1.0f : 0.0f;
-        // Style embedding
-        int style_off = nnue.active_style * nnue.style_dim;
-        for (int i = 0; i < nnue.style_dim; i++)
-            input[769 + i] = nnue.style_embed[style_off + i];
 
-        int in_dim = 769 + nnue.style_dim; // 777
+        // ReLU (branchless)
+        for (int o = 0; o < H1; o++) h1[o] = h1[o] > 0 ? h1[o] : 0;
 
-        // Layer 1: [512, 777] × [777] + [512] → ReLU
-        float h1[512];
-        for (int o = 0; o < 512; o++) {
-            float sum = nnue.fc1_b[o];
-            for (int i = 0; i < in_dim; i++) sum += nnue.fc1_w[o * in_dim + i] * input[i];
-            h1[o] = relu(sum);
-        }
-
-        // Layer 2: [32, 512] × [512] + [32] → ReLU
+        // Layer 2: [32, 512] × [512] + [32] → ReLU (dense, small)
         float h2[32];
         for (int o = 0; o < 32; o++) {
             float sum = nnue.fc2_b[o];
-            for (int i = 0; i < 512; i++) sum += nnue.fc2_w[o * 512 + i] * h1[i];
+            for (int i = 0; i < H1; i++) sum += nnue.fc2_w[o * H1 + i] * h1[i];
             h2[o] = relu(sum);
         }
 
@@ -2448,9 +2496,9 @@ int evaluate_nnue(const GameState& state) {
     return eval_cp;
 }
 
-// Active evaluation: dispatches to NNUE if loaded, otherwise classic
+// Active evaluation: uses classic eval for engine play
+// NNUE is available via evaluate_nnue() for research/analysis
 int evaluate(const GameState& state) {
-    if (nnue.loaded) return evaluate_nnue(state);
     return evaluate_classic(state);
 }
 

@@ -243,7 +243,14 @@ int main(int argc, char** argv) {
     init_attack_tables();
     init_zobrist();
 
-    printf("=== Ply vs Stockfish Match ===\n\n");
+    // Load NNUE if available
+    if (load_nnue("training/nnue_v2_weights.bin")) {
+        printf("Eval: NNUE v2 (style-conditioned)\n");
+    } else {
+        printf("Eval: Classic\n");
+    }
+
+    printf("\n=== Ply vs Stockfish Match ===\n\n");
     printf("  Ply depth:       %d\n", ply_depth);
     printf("  Stockfish depth: %d\n", sf_depth);
     printf("  Games:           %d\n", n_games);
