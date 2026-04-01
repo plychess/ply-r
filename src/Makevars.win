@@ -1,0 +1,3 @@
+# src/Makevars.win — Windows build flags for ply package
+
+CXX_STD = CXX17
