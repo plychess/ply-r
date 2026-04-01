@@ -243,8 +243,10 @@ int main(int argc, char** argv) {
     init_attack_tables();
     init_zobrist();
 
-    // Load NNUE if available
-    if (load_nnue("training/nnue_v2_weights.bin")) {
+    // Load NNUE if available (v3 first, then v2)
+    if (load_nnue("analysis/nnue_v3_weights.bin")) {
+        printf("Eval: NNUE v3 (bulk trained, 1M positions)\n");
+    } else if (load_nnue("training/nnue_v2_weights.bin")) {
         printf("Eval: NNUE v2 (style-conditioned)\n");
     } else {
         printf("Eval: Classic\n");

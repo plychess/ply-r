@@ -2120,6 +2120,10 @@ struct NNUEWeights {
 
 static NNUEWeights nnue;
 
+// Pre-computed bias + style for layer 1 (avoids recomputing per eval)
+static float nnue_h1_base[512];
+static bool  nnue_h1_base_valid = false;
+
 static void precompute_h1_base(); // forward declaration
 
 static void read_floats(FILE* f, std::vector<float>& v, int count) {
@@ -2137,8 +2141,50 @@ bool load_nnue(const std::string& path) {
     fread(&np, 4, 1, f);
     fread(&sd, 4, 1, f);
 
-    // Support both v1 (0x4E4E5545) and v2 (0x4E4E5532)
-    if (magic != 0x4E4E5545 && magic != 0x4E4E5532) { fclose(f); return false; }
+    // Support v1 (0x4E4E5545), v2 (0x4E4E5532), v3 (0x4E4E5533)
+    if (magic != 0x4E4E5545 && magic != 0x4E4E5532 && magic != 0x4E4E5533) {
+        fclose(f); return false;
+    }
+
+    if (magic == 0x4E4E5533) {
+        // v3: no style conditioning — header is [magic, n_input, h1_size, h2_size]
+        int n_input = nf;  // 769
+        int h1_size = np;  // 512 (reuses header field)
+        int h2_size = sd;  // 32  (reuses header field)
+
+        nnue.n_features = n_input;
+        nnue.n_players = 0;
+        nnue.style_dim = 0;
+
+        read_floats(f, nnue.fc1_w, h1_size * n_input);
+        read_floats(f, nnue.fc1_b, h1_size);
+        read_floats(f, nnue.fc2_w, h2_size * h1_size);
+        read_floats(f, nnue.fc2_b, h2_size);
+        read_floats(f, nnue.fc3_w, 1 * h2_size);
+        read_floats(f, nnue.fc3_b, 1);
+        nnue.fc4_w.clear(); nnue.fc4_b.clear();
+        nnue.style_embed.clear();
+        nnue.means.clear(); nnue.sds.clear();
+
+        fread(&nnue.eval_mean, sizeof(float), 1, f);
+        fread(&nnue.eval_sd, sizeof(float), 1, f);
+
+        fclose(f);
+        nnue.loaded = true;
+        nnue.version = 3;
+
+        // Transpose fc1 weights: [n_input][h1_size] for sparse access
+        nnue.fc1_wt.resize(n_input * h1_size);
+        for (int o = 0; o < h1_size; o++)
+            for (int i = 0; i < n_input; i++)
+                nnue.fc1_wt[i * h1_size + o] = nnue.fc1_w[o * n_input + i];
+
+        // Precompute bias-only base (no style)
+        for (int o = 0; o < h1_size; o++) nnue_h1_base[o] = nnue.fc1_b[o];
+        nnue_h1_base_valid = true;
+
+        return true;
+    }
 
     nnue.n_features = nf;
     nnue.n_players = np;
@@ -2192,10 +2238,6 @@ bool load_nnue(const std::string& path) {
     precompute_h1_base();
     return true;
 }
-
-// Pre-computed bias + style for layer 1 (avoids recomputing per eval)
-static float nnue_h1_base[512];
-static bool  nnue_h1_base_valid = false;
 
 static void precompute_h1_base() {
     if (!nnue.loaded || nnue.version != 2) return;
@@ -2403,7 +2445,7 @@ static inline float relu(float x) { return x > 0 ? x : 0; }
 int evaluate_nnue(const GameState& state) {
     if (!nnue.loaded) return evaluate_classic(state);
 
-    if (nnue.version == 2) {
+    if (nnue.version == 2 || nnue.version == 3) {
         // v2: sparse bitboard input (769 + 8 style → 512 → 32 → 1)
         // Key optimization: instead of multiplying all 777 inputs,
         // start with bias + style contribution, then only ADD weight
@@ -2496,8 +2538,7 @@ int evaluate_nnue(const GameState& state) {
     return eval_cp;
 }
 
-// Active evaluation: uses classic eval for engine play
-// NNUE is available via evaluate_nnue() for research/analysis
+// Active evaluation: classic eval (NNUE available via evaluate_nnue)
 int evaluate(const GameState& state) {
     return evaluate_classic(state);
 }
