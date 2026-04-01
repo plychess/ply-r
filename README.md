@@ -4,6 +4,8 @@ A fast, C++-backed chess engine package for R.
 
 Inspired by: https://github.com/kjda/chess-on-go
 
+Funded by: www.chesshere.com
+
 Current status: early but functional (v0.1.0). The core move generator, game registry, SAN replay, and enrichment pipeline are implemented and tested.
 
 ## Snapshot
